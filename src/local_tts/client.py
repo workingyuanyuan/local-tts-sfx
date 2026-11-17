@@ -26,8 +26,6 @@ from typing import Any, Callable, Optional
 
 import httpx
 
-from local_tts.text import estimate_seconds
-
 DEFAULT_URL = os.environ.get("LOCAL_TTS_URL", "http://127.0.0.1:8765")
 OUTPUT_DIR = Path(os.environ.get("LOCAL_TTS_OUTPUT_DIR", Path.home() / ".local/share/local-tts/output")).expanduser()
 FORMATS = ("wav", "flac", "mp3")
@@ -35,10 +33,6 @@ FORMATS = ("wav", "flac", "mp3")
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
-# Real-time factor (synthesis seconds per estimated audio second; measured ~0.6 per real audio second,
-# and cloned voices run longer than the text estimate) and cold model load, for wait estimates.
-RTF = 0.75
-LOAD_SECONDS = 20
 # Per-request wall-clock limits: polls are short; the audio download happens once, after completion.
 POLL_TIMEOUT = 10.0
 DOWNLOAD_TIMEOUT = 30.0
@@ -171,19 +165,11 @@ def raise_job_error(job: dict) -> None:
         raise ClientError(err.pop("code"), err.pop("message"), job_id=job["id"], job_status="failed", **err)
 
 
-def estimate_remaining(text: Optional[str], job: dict[str, Any], model_loaded: Optional[bool]) -> Optional[float]:
-    """Rough seconds until a job finishes (for agents deciding how long to wait); None if unknown."""
-    if not text:
-        return None
-    total = estimate_seconds(text) * RTF
-    p = job.get("progress") or {}
-    if p.get("segments_total"):
-        total *= 1 - p["segments_done"] / p["segments_total"]
-    if job.get("status") == "queued":
-        total += (job.get("queue_position") or 1) * 30  # unknown work ahead: assume ~30 s each
-    if model_loaded is False and job.get("status") in ("queued", "running"):
-        total += LOAD_SECONDS
-    return round(total, 1)
+def pending(job: dict[str, Any]) -> dict[str, Any]:
+    """A pending result. The estimate comes from the service, which measures this machine's speed."""
+    return {"status": "pending", "job_id": job["id"], "job_status": job["status"],
+            "queue_position": job.get("queue_position"), "progress": job.get("progress"),
+            "estimated_remaining_seconds": job.get("estimated_remaining_seconds")}
 
 
 class TTSClient:
@@ -258,6 +244,10 @@ class TTSClient:
                     raise
             await asyncio.sleep(0.5)
 
+    async def cancel(self, job_id: str) -> dict:
+        """Cancel a job; returns its snapshot (status "failed" once stopped, else still "running")."""
+        return (await self._request("DELETE", f"/v1/jobs/{job_id}")).json()
+
     async def job(self, job_id: str, timeout: float = POLL_TIMEOUT) -> dict:
         return (await self._request("GET", f"/v1/jobs/{job_id}", timeout=timeout)).json()
 
@@ -285,7 +275,8 @@ class TTSClient:
             await asyncio.sleep(poll if r is None else min(poll, r))
 
     async def save(self, job: dict, path: Path, overwrite: bool) -> dict:
-        """Download a succeeded job's audio to `path`; return the result metadata."""
+        """Download a succeeded job's audio to `path`; return the result metadata (the per-segment
+        "timeline" included; callers drop it unless asked, as it repeats the whole input text)."""
         raise_job_error(job)
         r = job["result"]
         if path.suffix.lower().lstrip(".") != r["format"]:
@@ -301,18 +292,11 @@ class TTSClient:
                 "segments": r["segments"], "job_id": job["id"]}
         if r.get("warnings"):  # e.g. a segment that stayed suspiciously short (a sentence may be missing)
             out["warnings"] = r["warnings"]
+        if r.get("timeline") is not None:
+            out["timeline"] = r["timeline"]
         return out
 
-    async def pending(self, job: dict, text: Optional[str], deadline: Optional[Deadline] = None) -> dict:
-        """A pending result. Whether the model is loaded (for the estimate) is asked only while the
-        call's deadline has not passed; otherwise it is unknown."""
-        loaded = None
-        if deadline is None or not deadline.expired():
-            try:
-                timeout = 2.0 if deadline is None else min(2.0, deadline.remaining() or 0.01)
-                loaded = (await self.health(timeout=timeout)).get("loaded_model") is not None
-            except ClientError:
-                pass
-        return {"status": "pending", "job_id": job["id"], "job_status": job["status"],
-                "queue_position": job.get("queue_position"), "progress": job.get("progress"),
-                "estimated_remaining_seconds": estimate_remaining(text, job, loaded)}
+
+def with_timeline(result: dict[str, Any], timeline: bool) -> dict[str, Any]:
+    """A completed result with or without its per-segment timeline."""
+    return result if timeline else {k: v for k, v in result.items() if k != "timeline"}

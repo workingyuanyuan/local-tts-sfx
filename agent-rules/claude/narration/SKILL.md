@@ -16,6 +16,8 @@ MCP server `local-tts` (load them with ToolSearch if they are deferred):
 - `mcp__local-tts__generate_speech` — text → audio file. Returns path, duration_seconds, sample_rate,
   channels, format, model, voice; or status `pending` with a job_id for long text.
 - `mcp__local-tts__get_speech_job` — keep waiting for a pending job and write its file.
+- `mcp__local-tts__cancel_speech_job` — stop a job that is no longer wanted (wrong text, superseded
+  script) so the GPU is free for the replacement.
 - `mcp__local-tts__list_voices`, `mcp__local-tts__list_models`, `mcp__local-tts__tts_status`.
 
 If MCP is unavailable, use the CLI with a bounded wait:
@@ -49,14 +51,17 @@ Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_
    (`overwrite: true`); on `output_exists` choose another name or ask.
 4. **Split by how the audio will be used.** Video or slides: one file per scene or slide, so each
    duration sets that scene's length. One continuous reading (article, story, podcast): one call with
-   the full text; the service splits long text itself. Limits per call: 20,000 characters, each
+   the full text; the service splits long text itself. Pass `timeline: true` to also get each
+   segment's start/end seconds, paragraph and text; paragraphs (blank lines) always start a new
+   segment, so a single call can still be cut at paragraph breaks. Limits per call: 20,000 characters, each
    `[pause]` ≤ 60 s and all pauses ≤ 600 s in total (`input_too_long` / `invalid_pause` otherwise).
    Longer text: split at paragraph boundaries into batches with one fixed `voice`, generate them in
    order and join them (step 6). Calls run one at a time on one GPU, so make them sequentially.
 5. **Long text and interrupted calls.** Status `pending` → call `get_speech_job` with the result's
    `next.arguments` (job_id, the original absolute `output_path`, and `overwrite` if you set it) until
    `completed`. Always pass the path: after an MCP restart the default location is outside the
-   project. Never call `generate_speech` again for text that is still pending. When an error carries
+   project. Never call `generate_speech` again for text that is still pending; if that text is no
+   longer wanted, `cancel_speech_job` it first. When an error carries
    a `job_id`, follow its `recovery` field:
    - interrupted (connection, timeout, write error): `get_speech_job` with the arguments it gives;
    - `job_status: "failed"`, or `unknown_job`: the job is over; fix the cause if there is one and make
@@ -75,9 +80,12 @@ Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_
 
 Errors are JSON `{"error": {"code", "message", ...}}`.
 - `server_unreachable`: `systemctl --user start local-tts`, then `tts health`.
-- A completed result with `warnings` (a segment stayed suspiciously short: a sentence may be missing): regenerate
+- A completed result with `warnings` (a segment stayed suspiciously short: a sentence may be missing;
+  the warning quotes the passage): regenerate
   that file once (`overwrite: true`); if the warning persists, tell the user which file and passage.
 - `queue_full`/`results_full`: wait a little and retry. `unknown_voice` / `unknown_model`: pick from `available`.
+- `cancelled`: the job was cancelled (by you or someone else); submit again if it is still needed.
+  `job_finished`: the job had already finished, nothing to cancel.
 - `output_exists`: see step 3. `invalid_path`: the path must be absolute (Windows `C:\...` paths work).
 - `segment_failed` / `segment_truncated` name the failing segment: rephrase or shorten that passage
   and submit again. `unknown_job` (the service restarted or the job expired): submit it again.

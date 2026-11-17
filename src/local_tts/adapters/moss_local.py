@@ -78,6 +78,12 @@ class MossLocalAdapter(Adapter):
         gc.collect()
         torch.cuda.empty_cache()
 
+    def release_cache(self) -> None:
+        # The caching allocator keeps a long job's activations reserved (seen: ~2 GiB above the
+        # loaded weights); hand them back so other GPU work on this machine can use them.
+        if self.model is not None:
+            torch.cuda.empty_cache()
+
     def voice_reference(self, voice: VoiceEntry) -> torch.Tensor:
         path = Path(voice.reference_audio)
         key = (str(path), path.stat().st_mtime)

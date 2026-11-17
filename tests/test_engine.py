@@ -264,3 +264,44 @@ def test_rerendered_early_piece_drops_its_old_warning():
         return t_est * 0.5 if text == title and first_takes else "ok"
     res = run(FakeAdapter(behaviour), title + "\n\n" + LONG)
     assert calls.count(title) == 4 and res.warnings == []
+
+
+def test_timeline_marks_each_segment_and_paragraph():
+    text = "標題。\n\n" + LONG + "\n\n[pause 2s]最後一段的文字。"
+    res = run(FakeAdapter(lambda t, i: "ok"), text, max_segment_seconds=10)
+    tl = res.timeline
+    assert len(tl) == res.segments and [t["index"] for t in tl] == list(range(res.segments))
+    assert tl[0]["paragraph"] == 0 and tl[-1]["paragraph"] == 2 and tl[-1]["text"] == "最後一段的文字。"
+    for a, b in zip(tl, tl[1:]):
+        assert a["start"] < a["end"] <= b["start"]  # gaps (and the leading pause) lie between segments
+    assert tl[-1]["start"] - tl[-2]["end"] >= 2.0
+    assert abs(tl[-1]["end"] - res.duration) < 0.01
+
+
+def test_timeline_survives_split_and_rerender():
+    # The short title is re-rendered with the reference voice; the long segment is truncated once.
+    calls = []
+
+    def behaviour(t, i):
+        calls.append(t)
+        return "truncate" if t == LONG and calls.count(LONG) == 1 else "ok"
+    res = run(FakeAdapter(behaviour), "標題。" + "\n\n" + LONG, max_segment_seconds=60)
+    assert res.splits == 1 and [t["text"] for t in res.timeline] == ["標題。", LONG]
+    assert abs(res.timeline[-1]["end"] - res.duration) < 0.01
+
+
+def test_warning_names_the_text():
+    res = run(FakeAdapter(lambda t, i: estimate_seconds(t) * 0.5), LONG)
+    assert res.warnings and LONG[:10] in res.warnings[0]
+
+
+def test_cancel_stops_before_the_next_generation():
+    adapter = FakeAdapter(lambda t, i: "ok")
+    flag = {"on": False}
+
+    def progress(done, total):
+        flag["on"] = True
+    req = SynthesisRequest(model=adapter.entry, voice=None, text="第一段。\n\n第二段。", language="zh")
+    with pytest.raises(TTSError) as e:
+        synthesize(adapter, req, SegmentingConfig(), progress, cancelled=lambda: flag["on"])
+    assert e.value.code == "cancelled" and len(adapter.calls) == 1

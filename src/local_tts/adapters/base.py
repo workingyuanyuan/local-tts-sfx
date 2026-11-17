@@ -39,6 +39,9 @@ class Adapter(ABC):
     @abstractmethod
     def unload(self) -> None: ...
 
+    def release_cache(self) -> None:
+        """Free cached-but-unused accelerator memory between jobs (optional)."""
+
     @abstractmethod
     def voice_reference(self, voice: VoiceEntry) -> Any:
         """Prepared reference for a registered voice (may be cached)."""

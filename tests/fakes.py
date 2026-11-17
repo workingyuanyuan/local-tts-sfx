@@ -15,6 +15,7 @@ GATE = threading.Event()  # generation blocks until set
 FAIL_LOAD = {"on": False}
 FAIL_GEN = {"on": False}
 LOAD_HELD = []  # weakrefs to objects held during a failed load
+RELEASES = []  # one entry per release_cache() call
 
 
 class Big:
@@ -45,6 +46,9 @@ class GatedAdapter(Adapter):
     def unload(self):
         self.partial = None
         self._loaded = False
+
+    def release_cache(self):
+        RELEASES.append(self.entry.id)
 
     def voice_reference(self, voice):
         return None

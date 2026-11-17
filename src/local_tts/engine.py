@@ -42,6 +42,8 @@ class ModelManager:
         }
         self.current: Optional[Adapter] = None
         self.lock = threading.Lock()
+        # Wall-clock seconds of the most recent acquire() that actually loaded a model (else None).
+        self.last_load_seconds: Optional[float] = None
 
     def adapter(self, model_id: str) -> Adapter:
         return self.adapters[model_id]
@@ -49,6 +51,7 @@ class ModelManager:
     def acquire(self, model_id: str) -> Adapter:
         with self.lock:
             target = self.adapters[model_id]
+            self.last_load_seconds = None
             if self.current is target and target.loaded:
                 return target
             if self.current is not None:
@@ -70,7 +73,8 @@ class ModelManager:
                 # tensor referenced from its frames) stays attached to the error.
                 target.unload()
                 raise error
-            log.info("loaded %s in %.1fs", model_id, time.perf_counter() - t)
+            self.last_load_seconds = time.perf_counter() - t
+            log.info("loaded %s in %.1fs", model_id, self.last_load_seconds)
             self.current = target
             return target
 
@@ -83,6 +87,12 @@ class ModelManager:
             self.current = None
             log.info("unloaded %s", model_id)
             return model_id
+
+    def release_cache(self) -> None:
+        """Return cached-but-unused GPU memory (the loaded model stays). Worker thread only."""
+        with self.lock:
+            if self.current is not None:
+                self.current.release_cache()
 
     @property
     def loaded_model(self) -> Optional[str]:
@@ -108,16 +118,27 @@ class SynthesisResult:
     retries: int = 0
     splits: int = 0
     warnings: list[str] = field(default_factory=list)
+    # One entry per top-level segment: {"index", "paragraph", "start", "end", "text"} (seconds).
+    timeline: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
         return self.audio.shape[1] / self.sample_rate
 
 
+class Cancelled(TTSError):
+    def __init__(self):
+        super().__init__("cancelled", "The job was cancelled.", 409)
+
+
 class _Synthesis:
+    """Slots are two-element lists [audio, segment index or None for silence], so an early piece can
+    be replaced in place and the timeline can be computed from the final concatenation."""
+
     def __init__(self, adapter: Adapter, req: SynthesisRequest, cfg: SegmentingConfig,
-                 progress: Optional[Callable[[int, int], None]]):
+                 progress: Optional[Callable[[int, int], None]], cancelled: Optional[Callable[[], bool]] = None):
         self.adapter, self.req, self.cfg, self.progress = adapter, req, cfg, progress
+        self.cancelled = cancelled
         self.retries = 0
         self.splits = 0
         self.warnings: list[tuple[list, str]] = []  # (slot, warning): dropped if the slot is re-rendered
@@ -155,12 +176,12 @@ class _Synthesis:
                 between = self.cfg.paragraph_gap_seconds if prev.paragraph_end else self.cfg.segment_gap_seconds
                 gap += prev.trail_silence + between
             if gap > 0:
-                out.append([self._silence(gap)])
+                out.append([self._silence(gap), None])
             out.extend(slots)
             if seg_index is None and self.progress:
                 self.progress(i + 1, len(segments))
         if segments[-1].trail_silence > 0:
-            out.append([self._silence(segments[-1].trail_silence)])
+            out.append([self._silence(segments[-1].trail_silence), None])
         return out
 
     def _render(self, text: str, seg_index: int, depth: int, seed: Optional[int]) -> list[list[np.ndarray]]:
@@ -170,6 +191,8 @@ class _Synthesis:
         best = None  # (dur, audio, reference): the longest suspiciously short attempt
         for attempt in range(self.cfg.max_retries + 1):
             s = None if seed is None else seed + attempt
+            if self.cancelled is not None and self.cancelled():
+                raise Cancelled()
             try:
                 r = self.adapter.generate(text, language=self.req.language, reference=self.reference,
                                           max_frames=self._budget(text), seed=s)
@@ -210,7 +233,7 @@ class _Synthesis:
         if best is not None:
             dur, audio, reference = best
             warning = (f"segment {seg_index}: {dur:.1f}s of audio for ~{est:.1f}s of text after "
-                       f"{self.cfg.max_retries} retries; a sentence may be missing")
+                       f"{self.cfg.max_retries} retries; a sentence may be missing from: {text}")
             log.warning(warning)
             slots = self._accept(audio, dur, reference, text, seg_index, depth, seed)
             self.warnings.append((slots[0], warning))
@@ -220,7 +243,7 @@ class _Synthesis:
 
     def _accept(self, audio: np.ndarray, dur: float, reference: Any, text: str, seg_index: int, depth: int,
                 seed: Optional[int]) -> list[list[np.ndarray]]:
-        slot = [audio]
+        slot = [audio, seg_index]
         if self.follow_first and self.reference is None and reference is not None:
             if dur >= MIN_REFERENCE_SECONDS:
                 self.reference = reference
@@ -247,9 +270,31 @@ class _Synthesis:
                                  if s is not slot]
         audio = np.concatenate([x[0] for x in slots], axis=1)
         return SynthesisResult(audio=audio, sample_rate=self.sample_rate, segments=len(segments),
-                               retries=self.retries, splits=self.splits, warnings=[w for _, w in self.warnings])
+                               retries=self.retries, splits=self.splits, warnings=[w for _, w in self.warnings],
+                               timeline=self._timeline(segments, slots))
+
+    def _timeline(self, segments: list[Segment], slots: list[list]) -> list[dict[str, Any]]:
+        """Where each top-level segment's speech starts and ends in the final audio (gaps excluded)."""
+        spans: dict[int, list[float]] = {}
+        pos = 0
+        for audio, index in slots:
+            end = pos + audio.shape[1]
+            if index is not None:
+                span = spans.setdefault(index, [pos, end])
+                span[1] = end
+            pos = end
+        out, paragraph = [], 0
+        for i, seg in enumerate(segments):
+            start, end = spans.get(i, (pos, pos))
+            out.append({"index": i, "paragraph": paragraph, "start": round(start / self.sample_rate, 3),
+                        "end": round(end / self.sample_rate, 3), "text": seg.text})
+            if seg.paragraph_end:
+                paragraph += 1
+        return out
 
 
 def synthesize(adapter: Adapter, req: SynthesisRequest, cfg: SegmentingConfig,
-               progress: Optional[Callable[[int, int], None]] = None) -> SynthesisResult:
-    return _Synthesis(adapter, req, cfg, progress).run()
+               progress: Optional[Callable[[int, int], None]] = None,
+               cancelled: Optional[Callable[[], bool]] = None) -> SynthesisResult:
+    """`cancelled` is checked before every generation attempt; when it returns True, Cancelled is raised."""
+    return _Synthesis(adapter, req, cfg, progress, cancelled).run()

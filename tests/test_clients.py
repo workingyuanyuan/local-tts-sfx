@@ -118,7 +118,8 @@ def test_mcp_tools_listed():
     async def go():
         async with mcp.Client(mcp_server.server) as c:
             return [t.name for t in (await c.list_tools()).tools]
-    assert set(asyncio.run(go())) == {"generate_speech", "get_speech_job", "list_models", "list_voices", "tts_status"}
+    assert set(asyncio.run(go())) == {"generate_speech", "get_speech_job", "cancel_speech_job",
+                                       "list_models", "list_voices", "tts_status"}
 
 
 def test_mcp_generate_completed(tts, tmp_path):
@@ -162,7 +163,7 @@ def test_mcp_lists(tts):
     models = call("list_models").structured_content["result"]
     assert models[0]["id"] == "moss-tts-local-v1.5" and models[0]["default"] is True
     voices = call("list_voices", model="moss-tts-local-v1.5").structured_content["result"]
-    assert {v["name"] for v in voices} == {"demo_zh_female", "demo_en"}
+    assert {"demo_zh_female", "demo_en"} <= {v["name"] for v in voices}  # plus any locally registered
     assert call("tts_status").structured_content["status"] == "ok"
 
 
@@ -432,9 +433,9 @@ def test_cancelled_save_then_retry_writes_once(tts, tmp_path, monkeypatch):
     async def cancelled_then_retry():
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(1.5):
-                await mcp_server._get_job(jid, 30, None, False)
+                await mcp_server._get_job(jid, 30, None, False, False)
         assert not out.exists() and not mcp_server.JOBS[jid].lock.locked()
-        return await mcp_server._get_job(jid, 30, None, False)
+        return await mcp_server._get_job(jid, 30, None, False, False)
     done = asyncio.run(cancelled_then_retry())
     assert done["status"] == "completed" and writes == [out] and out.exists()
     # The write runs on the event-loop thread (not to_thread), so cancellation cannot orphan it.
@@ -700,3 +701,162 @@ def test_cli_no_wait_with_timeout_skips_health_after_deadline(tts, tmp_path, cap
     seen = slow(tts, monkeypatch, {"/v1/jobs": 0.45, "/health": 30})
     assert cli.main(["say", "不等。", "-o", str(tmp_path / "n.wav"), "--no-wait", "--timeout", "0", "--json"]) == 3
     assert seen == ["/v1/jobs"]
+
+
+# --- timeline, cancel, estimates, wait default -------------------------------------------------
+
+TWO_PARAGRAPHS = "第一段的內容在這裡。\n\n第二段的內容在這裡。"
+
+
+def test_mcp_timeline_is_opt_in_and_carried_by_next(tts, tmp_path):
+    GATE.set()
+    plain = call("generate_speech", text=TWO_PARAGRAPHS, output_path=str(tmp_path / "a.wav")).structured_content
+    assert plain["status"] == "completed" and "timeline" not in plain
+    r = call("generate_speech", text=TWO_PARAGRAPHS, output_path=str(tmp_path / "b.wav"),
+             timeline=True).structured_content
+    tl = r["timeline"]
+    assert [t["paragraph"] for t in tl] == [0, 1] and tl[0]["text"] == "第一段的內容在這裡。"
+    assert tl[0]["start"] == 0 and tl[0]["end"] < tl[1]["start"] < tl[1]["end"] <= r["duration_seconds"]
+    GATE.clear()
+    p = call("generate_speech", text="慢。", output_path=str(tmp_path / "c.wav"), timeline=True,
+             wait_seconds=0.2).structured_content
+    assert p["status"] == "pending" and p["next"]["arguments"]["timeline"] is True
+    GATE.set()
+    mcp_server.JOBS.clear()  # after an MCP restart, next.arguments alone still asks for the timeline
+    done = call("get_speech_job", **p["next"]["arguments"]).structured_content
+    assert done["status"] == "completed" and len(done["timeline"]) == 1
+
+
+def test_mcp_cancel_queued_job(tts, tmp_path):
+    running = call("generate_speech", text="先跑。", output_path=str(tmp_path / "r.wav"), wait_seconds=0)
+    queued = call("generate_speech", text="不要了。", output_path=str(tmp_path / "q.wav"), wait_seconds=0)
+    jid = queued.structured_content["job_id"]
+    assert call("cancel_speech_job", job_id=jid).structured_content == {"status": "cancelled", "job_id": jid}
+    assert call("cancel_speech_job", job_id=jid).structured_content["status"] == "cancelled"  # repeatable
+    r = call("get_speech_job", job_id=jid)
+    err = error_of(r)
+    assert err["code"] == "cancelled" and err["job_status"] == "failed" and "generate_speech" in err["recovery"]
+    assert not (tmp_path / "q.wav").exists()
+    GATE.set()
+    assert call("get_speech_job", **running.structured_content["next"]["arguments"]).structured_content[
+        "status"] == "completed"
+
+
+def test_cancel_running_job_stops_before_next_segment(tts, client, tmp_path):
+    jid = client.post("/v1/jobs", json={"input": TWO_PARAGRAPHS}).json()["id"]
+    end = time.time() + 5
+    while client.get(f"/v1/jobs/{jid}").json()["status"] != "running" and time.time() < end:
+        time.sleep(0.02)
+    r = client.delete(f"/v1/jobs/{jid}")
+    assert r.status_code == 202 and r.json()["cancel_requested"] is True
+    GATE.set()  # the first segment finishes; the second is never generated
+    while client.get(f"/v1/jobs/{jid}").json()["status"] == "running" and time.time() < end:
+        time.sleep(0.02)
+    j = client.get(f"/v1/jobs/{jid}").json()
+    assert j["status"] == "failed" and j["error"]["code"] == "cancelled"
+    assert j["progress"]["segments_done"] == 1
+    assert client.delete(f"/v1/jobs/{jid}").status_code == 200
+
+
+def test_cancel_finished_or_unknown_job_is_an_error(tts, client, capsys):
+    GATE.set()
+    r = client.post("/v1/audio/speech", json={"input": "完成了。"})
+    jid = r.headers["X-TTS-Job-Id"]
+    r = client.delete(f"/v1/jobs/{jid}")
+    assert r.status_code == 409 and r.json()["error"]["code"] == "job_finished"
+    assert cli.main(["cancel", "nope", "--json"]) == 1
+    err = json.loads(capsys.readouterr().err)["error"]
+    assert err["code"] == "unknown_job" and err["job_id"] == "nope"
+
+
+def test_cli_cancel_and_timeline(tts, tmp_path, capsys):
+    out = tmp_path / "t.wav"
+    assert cli.main(["say", TWO_PARAGRAPHS, "-o", str(out), "--no-wait", "--timeline", "--json"]) == 3
+    pend = json.loads(capsys.readouterr().out)
+    assert pend["fetch_command"].endswith("--timeline")
+    GATE.set()
+    assert cli.main(["job", pend["job_id"], "--wait", "-o", str(out), "--timeline", "--json"]) == 0
+    assert len(json.loads(capsys.readouterr().out)["timeline"]) == 2
+    GATE.clear()
+    assert cli.main(["say", "取消我。", "-o", str(tmp_path / "x.wav"), "--no-wait", "--json"]) == 3
+    jid = json.loads(capsys.readouterr().out)["job_id"]
+    assert cli.main(["cancel", jid, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] in ("cancelled", "cancelling")
+
+
+def test_estimates_come_from_the_service_and_learn(tts, client):
+    client.app.state.scheduler.cfg.idle_unload_seconds = 3600  # keep the model loaded between jobs
+    h = client.get("/health").json()["estimates"]["moss-tts-local-v1.5"]
+    assert h["rtf_measured"] is False and h["load_measured"] is False
+    a = client.post("/v1/jobs", json={"input": "第一個工作的內容比較長一點。"}).json()["id"]
+    b = client.post("/v1/jobs", json={"input": "第二個工作的內容比較長一點。"}).json()
+    jb = client.get(f"/v1/jobs/{b['id']}").json()
+    ja = client.get(f"/v1/jobs/{a}").json()
+    assert jb["estimated_remaining_seconds"] > ja["estimated_remaining_seconds"] > 0  # waits for a, then itself
+    GATE.set()
+    end = time.time() + 5
+    while client.get(f"/v1/jobs/{b['id']}").json()["status"] != "succeeded" and time.time() < end:
+        time.sleep(0.02)
+    assert client.get(f"/v1/jobs/{b['id']}").json()["estimated_remaining_seconds"] is None
+    h = client.get("/health").json()["estimates"]["moss-tts-local-v1.5"]
+    assert h["rtf_measured"] is True and h["load_measured"] is True
+
+
+def test_first_job_after_a_load_is_not_measured(tts, client):
+    client.app.state.scheduler.cfg.idle_unload_seconds = 3600
+    GATE.set()
+    est = lambda: client.get("/health").json()["estimates"]["moss-tts-local-v1.5"]  # noqa: E731
+    assert client.post("/v1/audio/speech", json={"input": "載入後的第一個工作。"}).status_code == 200
+    assert est()["rtf_measured"] is False and est()["load_measured"] is True  # warm-up
+    load = est()["load_seconds"]
+    assert client.post("/v1/audio/speech", json={"input": "暖機之後的工作內容。"}).status_code == 200
+    assert est()["rtf_measured"] is True and est()["load_seconds"] == load  # no load: not re-recorded
+
+
+def test_cache_released_when_queue_empties(tts, client):
+    from tests import fakes
+    fakes.RELEASES.clear()
+    GATE.set()
+    assert client.post("/v1/audio/speech", json={"input": "釋放快取。"}).status_code == 200
+    end = time.time() + 5
+    while not fakes.RELEASES and time.time() < end:
+        time.sleep(0.02)
+    assert fakes.RELEASES
+
+
+@pytest.mark.parametrize("raw,ok", [(None, 45.0), ("240", 240.0), ("0", 0.0), ("300", None), ("abc", None)])
+def test_mcp_default_wait_from_env(monkeypatch, raw, ok):
+    if raw is None:
+        monkeypatch.delenv("LOCAL_TTS_MCP_WAIT", raising=False)
+    else:
+        monkeypatch.setenv("LOCAL_TTS_MCP_WAIT", raw)
+    if ok is None:
+        with pytest.raises(SystemExit):
+            mcp_server._default_wait()
+    else:
+        assert mcp_server._default_wait() == ok
+
+
+def test_pauses_do_not_count_as_generation_work(tts, client):
+    a = client.post("/v1/jobs", json={"input": "你好。"}).json()  # holds the worker (gate closed)
+    b = client.post("/v1/jobs", json={"input": "你好。[pause 60s]"}).json()
+    sched = client.app.state.scheduler
+    assert sched.get(b["id"]).est_seconds == sched.get(a["id"]).est_seconds
+
+
+def test_cli_job_status_hides_timeline_unless_asked(tts, client, capsys):
+    GATE.set()
+    jid = client.post("/v1/audio/speech", json={"input": "看狀態。"}).headers["X-TTS-Job-Id"]
+    assert cli.main(["job", jid]) == 0
+    assert "timeline" not in json.loads(capsys.readouterr().out)["result"]
+    assert cli.main(["job", jid, "--timeline"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["timeline"]
+
+
+def test_interrupted_cancel_says_retry_cancel(tts, monkeypatch):
+    async def down(job_id):
+        raise ClientError("server_timeout", "slow")
+    monkeypatch.setattr(tts, "cancel", down)
+    err = error_of(call("cancel_speech_job", job_id="j1"))
+    assert err["job_id"] == "j1" and "cancel_speech_job again" in err["recovery"]
+    assert "get_speech_job with" not in err["recovery"]

@@ -1,13 +1,14 @@
 """tts-mcp: MCP (stdio) front end for tts-server.
 
 Waiting in a tool call (submit + polling) is bounded by `wait_seconds` (default 45 s, under Codex's
-default 60 s MCP tool timeout; max 240 s). Only a finished job adds the audio download (<= 30 s).
+default 60 s MCP tool timeout, or LOCAL_TTS_MCP_WAIT when the agent allows longer calls; max 240 s). Only a finished job adds the audio download (<= 30 s).
 A long narration returns status "pending" with a job_id; call get_speech_job(job_id) to keep
 waiting. Jobs are never resubmitted; once a job is known, every error carries its job_id.
 """
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -18,11 +19,28 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from local_tts.client import (ClientError, Deadline, TTSClient, as_client_error, check_target, resolve_output_path,
-                              resumable)
+from local_tts.client import (ClientError, Deadline, TTSClient, as_client_error, check_target, pending,
+                              resolve_output_path, resumable, with_timeline)
 
-DEFAULT_WAIT = 45.0
 MAX_WAIT = 240.0
+
+
+def _default_wait() -> float:
+    """45 s fits Codex's default 60 s tool timeout. An agent configured for longer tool calls can set
+    LOCAL_TTS_MCP_WAIT (e.g. 240 with Codex tool_timeout_sec = 330) to need fewer get_speech_job rounds."""
+    raw = os.environ.get("LOCAL_TTS_MCP_WAIT")
+    if raw is None:
+        return 45.0
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(f"tts-mcp: LOCAL_TTS_MCP_WAIT must be a number of seconds, got '{raw}'") from None
+    if not 0 <= value <= MAX_WAIT:
+        raise SystemExit(f"tts-mcp: LOCAL_TTS_MCP_WAIT must be between 0 and {MAX_WAIT:.0f}, got '{raw}'")
+    return value
+
+
+DEFAULT_WAIT = _default_wait()
 
 INSTRUCTIONS = """Local text-to-speech (runs on this machine's GPU). Use it whenever a task needs spoken
 audio: video narration, slide voice-over, reading teaching material aloud, audio previews.
@@ -36,7 +54,9 @@ audio: video narration, slide voice-over, reading teaching material aloud, audio
   generate_speech again for the same text while a job is pending. If an error carries a job_id,
   follow its "recovery" field: resume interrupted calls the same way; a failed job (job_status
   "failed") or an unknown_job needs a new generate_speech call.
-- A completed result with "warnings" may be missing a sentence: regenerate it once (overwrite=true)."""
+- A completed result with "warnings" may be missing a sentence: regenerate it once (overwrite=true).
+- timeline=true adds each segment's start/end seconds and text (to cut video or slides at paragraph
+  breaks from one long call). cancel_speech_job stops a job you no longer need (e.g. wrong text)."""
 
 # Writing tools create files; with overwrite=true they replace one, hence destructive. Local only.
 WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False)
@@ -75,10 +95,10 @@ client = TTSClient()
 class JobEntry:
     """Everything this process knows about one job. The lock is created once per job and guards the
     path decision and the save, so concurrent or repeated get_speech_job calls save each path once."""
-    text: Optional[str] = None            # None when recovered after a restart (no time estimate then)
     fmt: Optional[str] = None             # the job's audio format (known at submit or from the server)
     default_path: Optional[Path] = None   # output_path given to generate_speech
     default_overwrite: bool = False
+    default_timeline: bool = False
     saved: dict[Path, dict] = field(default_factory=dict)  # path -> result, for idempotent repeats
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     used: float = field(default_factory=time.monotonic)
@@ -117,10 +137,12 @@ def _error(e: Exception, **context: Any) -> ToolError:
                                "be resumed. Fix the cause above if there is one (e.g. rephrase or shorten the "
                                "named segment) and call generate_speech again.")
     elif context.get("job_id"):
-        args = _resume_args(context["job_id"], context.get("output_path"), context.get("overwrite", False))
+        args = _resume_args(context["job_id"], context.get("output_path"), context.get("overwrite", False),
+                            context.get("timeline", False))
         context["recovery"] = (f"The job may still be running; call get_speech_job with "
                                f"{json.dumps(args, ensure_ascii=False)} instead of resubmitting.")
     context.pop("overwrite", None)
+    context.pop("timeline", None)
     err.update({k: v for k, v in context.items() if v is not None and k not in err})
     return ToolError(json.dumps({"error": err}, ensure_ascii=False))
 
@@ -129,22 +151,24 @@ def _clamp_wait(wait_seconds: float) -> float:
     return max(0.0, min(float(wait_seconds), MAX_WAIT))
 
 
-def _resume_args(job_id: str, path, overwrite: bool) -> dict[str, Any]:
+def _resume_args(job_id: str, path, overwrite: bool, timeline: bool = False) -> dict[str, Any]:
     """get_speech_job arguments that finish the job as requested, even after an MCP restart."""
     args: dict[str, Any] = {"job_id": job_id}
     if path is not None:
         args["output_path"] = str(path)
     if overwrite:
         args["overwrite"] = True
+    if timeline:
+        args["timeline"] = True
     return args
 
 
-def _pending(job_id: str, pend: dict, path: Optional[Path], overwrite: bool) -> dict[str, Any]:
+def _pending(job_id: str, pend: dict, path: Optional[Path], overwrite: bool, timeline: bool) -> dict[str, Any]:
     """A pending result names its target file and the exact call to keep waiting."""
     if path is None:
         return pend
-    return pend | {"output_path": str(path),
-                   "next": {"tool": "get_speech_job", "arguments": _resume_args(job_id, path, overwrite)}}
+    return pend | {"output_path": str(path), "next": {
+        "tool": "get_speech_job", "arguments": _resume_args(job_id, path, overwrite, timeline)}}
 
 
 def _target(entry: JobEntry, output_path: Optional[str], overwrite: bool) -> tuple[Optional[Path], bool]:
@@ -156,17 +180,18 @@ def _target(entry: JobEntry, output_path: Optional[str], overwrite: bool) -> tup
     return path, overwrite or (path == entry.default_path and entry.default_overwrite)
 
 
-async def _deliver(job_id: str, entry: JobEntry, output_path: Optional[str], overwrite: bool, deadline: Deadline,
-                   last: Optional[dict] = None) -> dict[str, Any]:
+async def _deliver(job_id: str, entry: JobEntry, output_path: Optional[str], overwrite: bool, timeline: bool,
+                   deadline: Deadline, last: Optional[dict] = None) -> dict[str, Any]:
     """Under the job's lock: pick the target path, wait (within the deadline) and save it once."""
+    timeline = timeline or entry.default_timeline
     try:
         async with asyncio.timeout(deadline.remaining() or 0.01):
             await entry.lock.acquire()
     except TimeoutError:  # another call for this job holds the lock until its own deadline
-        pend = await client.pending(last or await client.job(job_id, timeout=deadline.request_timeout(10.0)),
-                                    entry.text, deadline)
+        pend = pending(last or await client.job(job_id, timeout=deadline.request_timeout(10.0)))
         path = Path(output_path) if output_path else entry.default_path
-        return _pending(job_id, pend, path, overwrite or (path == entry.default_path and entry.default_overwrite))
+        return _pending(job_id, pend, path, overwrite or (path == entry.default_path and entry.default_overwrite),
+                        timeline)
     try:
         if entry.fmt is None:  # recovered after a restart: ask the server for the job's format
             last = await client.job(job_id, timeout=deadline.request_timeout(10.0))
@@ -176,46 +201,68 @@ async def _deliver(job_id: str, entry: JobEntry, output_path: Optional[str], ove
             path, _ = resolve_output_path(None, entry.fmt)
             entry.default_path = path
         if path in entry.saved:
-            return entry.saved[path]
+            return with_timeline(entry.saved[path], timeline)
         job = await client.wait(job_id, deadline, last=last)
         if job["status"] in ("queued", "running"):
-            return _pending(job_id, await client.pending(job, entry.text, deadline), path, overwrite)
+            return _pending(job_id, pending(job), path, overwrite, timeline)
         result = await client.save(job, path, overwrite)
         entry.saved[path] = result
         log.info("job %s saved to %s", job_id, path)
-        return result
+        return with_timeline(result, timeline)
     finally:
         entry.lock.release()
 
 
-async def _generate(text, output_path, language, voice, model, fmt, overwrite, seed, wait_seconds) -> dict[str, Any]:
+async def _generate(text, output_path, language, voice, model, fmt, overwrite, seed, timeline,
+                    wait_seconds) -> dict[str, Any]:
     deadline = Deadline(_clamp_wait(wait_seconds))
     path, fmt = resolve_output_path(output_path, fmt)
     check_target(path, overwrite)
     job = await client.submit(text, model=model, voice=voice, language=language, fmt=fmt, seed=seed,
                               deadline=deadline)
     entry = _entry(job["id"])
-    entry.text, entry.fmt, entry.default_path, entry.default_overwrite = text, fmt, path, overwrite
+    entry.fmt, entry.default_path, entry.default_overwrite, entry.default_timeline = fmt, path, overwrite, timeline
     log.info("job %s submitted -> %s", job["id"], path)
     try:
-        return await _deliver(job["id"], entry, None, False, deadline, last=job)
+        return await _deliver(job["id"], entry, None, False, False, deadline, last=job)
     except Exception as e:  # noqa: BLE001 - attach the job so the caller can recover
         _forget(job["id"], e)
-        raise _error(e, job_id=job["id"], output_path=str(path), overwrite=overwrite) from None
+        raise _error(e, job_id=job["id"], output_path=str(path), overwrite=overwrite, timeline=timeline) from None
 
 
-async def _get_job(job_id, wait_seconds, output_path, overwrite) -> dict[str, Any]:
+async def _get_job(job_id, wait_seconds, output_path, overwrite, timeline) -> dict[str, Any]:
     deadline = Deadline(_clamp_wait(wait_seconds))
     entry = _entry(job_id)
     try:
-        return await _deliver(job_id, entry, output_path, overwrite, deadline)
+        return await _deliver(job_id, entry, output_path, overwrite, timeline, deadline)
     except Exception as e:  # noqa: BLE001
         _forget(job_id, e)
         try:
             path, overwrite = _target(entry, output_path, overwrite)
         except ClientError:
             path = output_path
-        raise _error(e, job_id=job_id, output_path=str(path) if path else None, overwrite=overwrite) from None
+        raise _error(e, job_id=job_id, output_path=str(path) if path else None, overwrite=overwrite,
+                     timeline=timeline or entry.default_timeline) from None
+
+
+async def _cancel(job_id) -> dict[str, Any]:
+    try:
+        job = await client.cancel(job_id)
+    except Exception as e:  # noqa: BLE001
+        _forget(job_id, e)
+        err = as_client_error(e).to_dict()
+        err.setdefault("job_id", job_id)
+        if err["code"] in ("unknown_job", "job_finished"):
+            err["recovery"] = "Nothing to cancel: the job is over or the service no longer has it."
+        else:  # interrupted: the cancel may or may not have arrived
+            err["recovery"] = ("Call cancel_speech_job again with the same job_id (repeating it is harmless). "
+                               "Do not call get_speech_job: it would save the unwanted audio.")
+        raise ToolError(json.dumps({"error": err}, ensure_ascii=False)) from None
+    if job["status"] == "failed":
+        return {"status": "cancelled", "job_id": job_id}
+    return {"status": "cancelling", "job_id": job_id, "job_status": job["status"],
+            "message": "The job stops before its next segment. If its last segment was already being "
+                       "generated it may still complete; get_speech_job shows the outcome."}
 
 
 async def _run(fn, *args) -> Any:
@@ -237,6 +284,7 @@ async def generate_speech(
     format: Optional[Literal["wav", "flac", "mp3"]] = None,
     overwrite: bool = False,
     seed: Optional[int] = None,
+    timeline: bool = False,
     wait_seconds: float = DEFAULT_WAIT,
 ) -> dict[str, Any]:
     """Synthesize speech from text and write it to an audio file.
@@ -252,17 +300,21 @@ async def generate_speech(
         format: wav | flac | mp3. Inferred from the output_path extension when omitted.
         overwrite: Replace output_path if it already exists (otherwise that is an error).
         seed: Optional integer (0..2**32-1) for reproducible output.
+        timeline: Also return "timeline": per segment its index, paragraph, start and end seconds in
+            the file, and text (segments are up to ~30 s; paragraphs always start a new segment).
         wait_seconds: How long this call waits for the result (max 240). If synthesis takes longer,
             the result is status "pending" with a job_id: call get_speech_job(job_id) to keep waiting.
 
     Returns: status "completed" with path, duration_seconds, sample_rate, channels, format, model,
-    voice (plus "warnings" when a segment stayed suspiciously short: a sentence may be missing, so
-    regenerate once with overwrite=true); or status "pending" with job_id, output_path, progress, estimated_remaining_seconds and
+    voice, segments (plus "warnings" when a segment stayed suspiciously short: a sentence may be
+    missing, so regenerate once with overwrite=true; "timeline" if asked); or status "pending" with
+    job_id, output_path, progress, estimated_remaining_seconds and
     "next" ({"tool": "get_speech_job", "arguments": {...}}: the call to keep waiting). Errors are
     JSON {"error": {"code", "message", ...}}; once the job exists they include job_id, output_path
     and recovery (how to resume, or job_status "failed" when only a new request can help).
     """
-    return await _run(_generate, text, output_path, language, voice, model, format, overwrite, seed, wait_seconds)
+    return await _run(_generate, text, output_path, language, voice, model, format, overwrite, seed, timeline,
+                      wait_seconds)
 
 
 @server.tool(annotations=WRITES)
@@ -271,6 +323,7 @@ async def get_speech_job(
     wait_seconds: float = DEFAULT_WAIT,
     output_path: Optional[str] = None,
     overwrite: bool = False,
+    timeline: bool = False,
 ) -> dict[str, Any]:
     """Wait for a pending generate_speech job and write its audio when done. Calling it again
     after completion returns the same result.
@@ -283,8 +336,19 @@ async def get_speech_job(
             default file outside the project. Its extension must match the job's format.
         overwrite: Replace an existing file at the target path (e.g. to retry after output_exists).
             Passing generate_speech's own path keeps that call's overwrite setting.
+        timeline: Include the per-segment timeline in the completed result (as in generate_speech).
     """
-    return await _run(_get_job, job_id, wait_seconds, output_path, overwrite)
+    return await _run(_get_job, job_id, wait_seconds, output_path, overwrite, timeline)
+
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True,
+                                         open_world_hint=False))
+async def cancel_speech_job(job_id: str) -> dict[str, Any]:
+    """Cancel a generate_speech job you no longer need (wrong text, superseded script), so the GPU and
+    queue are free for the next one. A queued job stops at once ("cancelled"); a running one stops
+    before its next segment ("cancelling"). No file is written. Cancelling a job that already
+    completed is an error (job_finished)."""
+    return await _run(_cancel, job_id)
 
 
 @server.tool(annotations=READS)

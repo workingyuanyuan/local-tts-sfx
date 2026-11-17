@@ -3,7 +3,9 @@
   tts say "你好" -o /abs/path/hello.wav --language zh [--voice NAME] [--model ID] [--overwrite]
   tts say -f script.txt -o /abs/out.mp3        (-f - reads stdin)
   tts job <job_id> [--wait] [-o /abs/out.wav]  (status of / fetch a job, e.g. after --no-wait)
+  tts cancel <job_id>                          (stop a job that is no longer needed)
   tts models | tts voices [--model ID] | tts health
+  --timeline (say / job): also report each segment's start/end seconds and text
 
 Exit codes: 0 done, 1 error (JSON on stderr), 2 usage error, 3 still pending (--no-wait / --timeout).
 """
@@ -13,8 +15,8 @@ import json
 import shlex
 import sys
 
-from local_tts.client import (DEFAULT_URL, ClientError, Deadline, TTSClient, as_client_error, check_target,
-                              raise_job_error, resolve_output_path, resumable)
+from local_tts.client import (DEFAULT_URL, ClientError, Deadline, TTSClient, as_client_error, check_target, pending,
+                              raise_job_error, resolve_output_path, resumable, with_timeline)
 
 EXIT_ERROR, EXIT_PENDING = 1, 3
 
@@ -43,7 +45,11 @@ def _human_result(r: dict) -> str:
 
 
 def _show_result(r: dict, a) -> None:
-    _print(r, a.json, _human_result(r))
+    r = with_timeline(r, a.timeline)
+    human = _human_result(r)
+    for t in r.get("timeline", []):
+        human += f"\n  {t['start']:8.3f}-{t['end']:8.3f}  [p{t['paragraph']} s{t['index']}] {t['text']}"
+    _print(r, a.json, human)
     if not a.json:  # in JSON they are part of the result
         for w in r.get("warnings", []):
             print(f"[tts] warning: {w}", file=sys.stderr)
@@ -56,6 +62,8 @@ def _fetch_command(a, job_id: str, path) -> str:
         cmd += ["--url", a.url]
     if a.overwrite:
         cmd.append("--overwrite")
+    if a.timeline:
+        cmd.append("--timeline")
     return shlex.join(cmd)
 
 
@@ -90,7 +98,7 @@ async def cmd_say(c: TTSClient, a) -> int:
         if not a.no_wait:
             job = await c.wait(job["id"], deadline, last=job, on_progress=_progress(a.quiet or a.json))
         if job["status"] in ("queued", "running"):
-            pend = (await c.pending(job, text, deadline)) | {"output_path": str(path), "fetch_command": fetch}
+            pend = pending(job) | {"output_path": str(path), "fetch_command": fetch}
             _print(pend, a.json, f"pending: job {job['id']} ({job['status']}); fetch later with:\n  {fetch}")
             return EXIT_PENDING
         r = await c.save(job, path, a.overwrite)
@@ -131,8 +139,24 @@ async def cmd_job(c: TTSClient, a) -> int:
             if resumable(err):
                 err.details["fetch_command"] = _fetch_command(a, a.job_id, target)
         raise err from None
+    if not a.timeline and job.get("result"):  # the timeline repeats the whole input text
+        job = job | {"result": {k: v for k, v in job["result"].items() if k != "timeline"}}
     _print(job, True, "")
     return 0 if job["status"] == "succeeded" else EXIT_PENDING
+
+
+async def cmd_cancel(c: TTSClient, a) -> int:
+    try:
+        job = await c.cancel(a.job_id)
+    except ClientError as e:
+        e.details.setdefault("job_id", a.job_id)
+        raise
+    if job["status"] == "failed":
+        _print({"status": "cancelled", "job_id": a.job_id}, a.json, f"cancelled: job {a.job_id}")
+    else:
+        _print({"status": "cancelling", "job_id": a.job_id, "job_status": job["status"]}, a.json,
+               f"cancelling: job {a.job_id} stops before its next segment")
+    return 0
 
 
 async def cmd_models(c: TTSClient, a) -> int:
@@ -184,6 +208,7 @@ def main(argv=None) -> int:
     s.add_argument("--overwrite", action="store_true", help="replace an existing output file")
     s.add_argument("--no-wait", action="store_true", help="submit and print the job id (exit 3)")
     s.add_argument("--timeout", type=float, help="stop waiting after N seconds (exit 3, job keeps running)")
+    s.add_argument("--timeline", action="store_true", help="report each segment's start/end seconds and text")
     s.set_defaults(func=cmd_say)
 
     j = sub.add_parser("job", parents=[common], help="show a job, or wait for it and save its audio")
@@ -192,7 +217,12 @@ def main(argv=None) -> int:
     j.add_argument("--timeout", type=float)
     j.add_argument("-o", "--output", help="save the audio here when the job has succeeded")
     j.add_argument("--overwrite", action="store_true")
+    j.add_argument("--timeline", action="store_true", help="report each segment's start/end seconds and text")
     j.set_defaults(func=cmd_job)
+
+    k = sub.add_parser("cancel", parents=[common], help="cancel a queued or running job")
+    k.add_argument("job_id")
+    k.set_defaults(func=cmd_cancel)
 
     sub.add_parser("models", parents=[common], help="list models").set_defaults(func=cmd_models)
     v = sub.add_parser("voices", parents=[common], help="list voices")

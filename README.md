@@ -81,6 +81,8 @@ systemctl --user status local-tts
 - 模型延遲載入：第一個請求才載入，約 10–20 秒；閒置 10 分鐘後自動卸載。
 - 沒有 systemd 或要除錯時，改為前景執行：`HF_HUB_OFFLINE=1 .venv/bin/tts-server`
 - user service 預設只在使用者登入期間執行；要開機常駐，執行 `sudo loginctl enable-linger $USER`。WSL 中，服務只在 WSL 執行期間運作。
+- 每個工作結束、佇列為空時，把 PyTorch 快取但未使用的顯存還給系統（模型權重仍常駐），方便同機的其他 GPU 工作使用。
+- 等待時間的預估：服務記錄每個模型實測的 RTF（生成秒數 ÷ 估計語音秒數；載入後的第一個工作含暖機，不計入）與載入秒數（移動平均；重啟後從 0.75 與 20 秒開始），用來計算排隊與執行中工作的 `estimated_remaining_seconds`。
 - 多張 GPU 時，可在 service 檔加入 `Environment=CUDA_VISIBLE_DEVICES=1`，指定要用哪一張。
 
 ## CLI：`tts`
@@ -90,6 +92,7 @@ tts say "你好，歡迎收看。" -l zh -o /abs/path/hello.wav            # 等
 tts say -f script.txt -l zh -v demo_zh_female -o /abs/out.mp3     # 從檔案讀（-f - 讀 stdin）
 tts say "..." -o /abs/out.wav --no-wait --json                    # 只送出，exit 3 並印出 job_id
 tts job <job_id> --wait -o /abs/out.wav                           # 等待並取回
+tts cancel <job_id>                                               # 取消不再需要的工作
 tts models | tts voices [-m MODEL] | tts health
 ```
 
@@ -98,6 +101,8 @@ tts models | tts voices [-m MODEL] | tts health
 - `--json` 輸出機器可讀結果；錯誤一律以 JSON 印到 stderr；結果有 `warnings`（可能漏句）時，文字模式會印到 stderr
 - exit code：0 完成、1 錯誤、2 用法錯誤、3 仍在處理（`--no-wait` 或 `--timeout` 到期，工作會繼續執行）
 - 工作送出後的錯誤附 `job_id`、`output_path` 與 `fetch_command`（接續等待用）；工作本身失敗（`job_status: "failed"`）或服務已不認得該工作（`unknown_job`，服務重啟或過期）時不附 `fetch_command`，需修正後重新送出（`tts say` 與 `tts job` 皆同）
+- `--timeline`（`say`、`job`）：結果另附每段的時間軸（見 MCP 的 `timeline`）；`fetch_command` 會保留這個選項
+- `tts cancel`：排隊中的工作立即取消（印出 `cancelled`）；執行中的工作在下一段開始前停止（印出 `cancelling`）
 - 環境變數：`LOCAL_TTS_URL`（服務位址）、`LOCAL_TTS_OUTPUT_DIR`（預設輸出目錄）
 
 ## MCP：`tts-mcp`
@@ -106,11 +111,14 @@ stdio MCP server（`.venv/bin/tts-mcp`）。工具：
 
 | 工具 | 說明 |
 |---|---|
-| `generate_speech` | `text`、`output_path`（絕對路徑）、`language`、`voice`、`model`、`format`、`overwrite`、`seed`、`wait_seconds`。完成時回傳 path、duration_seconds、sample_rate、channels、format、model、voice；有段落偏短（可能漏句）時另附 `warnings` |
-| `get_speech_job` | 等待 `pending` 的工作並寫檔；重複呼叫回傳同一結果 |
+| `generate_speech` | `text`、`output_path`（絕對路徑）、`language`、`voice`、`model`、`format`、`overwrite`、`seed`、`timeline`、`wait_seconds`。完成時回傳 path、duration_seconds、sample_rate、channels、format、model、voice、segments；有段落偏短（可能漏句）時另附 `warnings`（含該段文字）；`timeline=true` 時另附 `timeline` |
+| `get_speech_job` | 等待 `pending` 的工作並寫檔；重複呼叫回傳同一結果；也接受 `timeline` |
+| `cancel_speech_job` | 取消工作：排隊中立即取消（`cancelled`），執行中在下一段開始前停止（`cancelling`；若最後一段已在生成，仍可能完成）；不寫檔；已完成的工作回 `job_finished` |
 | `list_models` / `list_voices` / `tts_status` | 唯讀查詢 |
 
-一次呼叫的送出與等待共用 `wait_seconds` 期限（預設 45 秒、上限 240 秒；每個 HTTP 請求都在 `asyncio.timeout()` 內，等待網路時逾時即取消；整次呼叫的請求共用期限後 0.5 秒的寬限，讓 `wait_seconds=0` 也能送出，所以網路等待最多比期限晚 0.5 秒結束；期限已過時不再查詢狀態，也不查詢健康狀態，直接回 `pending`；送出沒收到回應時，剩餘時間不足 1 秒就不再重試），完成時另加音訊下載（≤ 30 秒）與本機寫檔（同步、毫秒級；取消為合作式，不會中斷這段）；長旁白會先回 `status: "pending"` 與 `job_id`、進度與預估剩餘秒數，再用 `get_speech_job` 接著等，不會重送。錯誤以 tool error 回傳 JSON（`{"error": {"code", "message", ...}}`）；`pending` 結果附 `output_path` 與 `next`（`{"tool": "get_speech_job", "arguments": {job_id, output_path, overwrite?}}`），照 `next.arguments` 呼叫即可接續，MCP 重啟後也一樣；明確傳回 `generate_speech` 的同一路徑時沿用其 `overwrite` 設定。工作成立後的錯誤附 `job_id`、`output_path` 與 `recovery`：呼叫中斷（連線、逾時、寫檔）時給出 `get_speech_job` 的參數（JSON）；工作本身失敗（`job_status: "failed"`）或 `unknown_job` 時指示修正後重新 `generate_speech`。未給路徑且 MCP 已重啟時，寫到預設輸出目錄（格式沿用工作格式）。
+`timeline`：每段一筆 `{index, paragraph, start, end, text}`（秒，相對於輸出檔；不含段間靜音）。段落（空行）一定從新的一段開始，所以一次長呼叫也能依段落切分影片或投影片。預設不回傳，因為它會重複整份輸入文字。`pending` 結果的 `next.arguments` 與錯誤的 `recovery` 會保留 `timeline`。
+
+一次呼叫的送出與等待共用 `wait_seconds` 期限（預設 45 秒，可用 tts-mcp 的環境變數 `LOCAL_TTS_MCP_WAIT` 改成 0–240 秒間的其他值；上限 240 秒；每個 HTTP 請求都在 `asyncio.timeout()` 內，等待網路時逾時即取消；整次呼叫的請求共用期限後 0.5 秒的寬限，讓 `wait_seconds=0` 也能送出，所以網路等待最多比期限晚 0.5 秒結束；期限已過時不再查詢狀態，直接回 `pending`（預估剩餘秒數由工作狀態附帶，不另外查詢）；送出沒收到回應時，剩餘時間不足 1 秒就不再重試），完成時另加音訊下載（≤ 30 秒）與本機寫檔（同步、毫秒級；取消為合作式，不會中斷這段）；長旁白會先回 `status: "pending"` 與 `job_id`、進度與預估剩餘秒數（由服務依本機實測速度計算），再用 `get_speech_job` 接著等，不會重送。錯誤以 tool error 回傳 JSON（`{"error": {"code", "message", ...}}`）；`pending` 結果附 `output_path` 與 `next`（`{"tool": "get_speech_job", "arguments": {job_id, output_path, overwrite?, timeline?}}`），照 `next.arguments` 呼叫即可接續，MCP 重啟後也一樣；明確傳回 `generate_speech` 的同一路徑時沿用其 `overwrite` 設定。工作成立後的錯誤附 `job_id`、`output_path` 與 `recovery`：呼叫中斷（連線、逾時、寫檔）時給出 `get_speech_job` 的參數（JSON）；工作本身失敗（`job_status: "failed"`）或 `unknown_job` 時指示修正後重新 `generate_speech`。未給路徑且 MCP 已重啟時，寫到預設輸出目錄（格式沿用工作格式）。
 
 註冊（在專案根目錄執行）：
 
@@ -119,7 +127,7 @@ claude mcp add -s user local-tts -- "$PWD/.venv/bin/tts-mcp"
 codex mcp add local-tts -- "$PWD/.venv/bin/tts-mcp"
 ```
 
-Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_timeout_sec = 330`（大於一次呼叫的最長時間約 270 秒）與 `default_tools_approval_mode = "approve"`（免核准；未設時每次呼叫都要核准，headless `codex exec` 會直接拒絕）。Claude Code 在 `~/.claude/settings.json` 的 `permissions.allow` 加入 `mcp__local-tts`（未設時第一次呼叫會詢問）。兩者開放後，Agent 可不經詢問在它指定的路徑建立音檔（帶 `overwrite` 時可覆寫）；工具不連外網。
+Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_timeout_sec = 330`（大於一次呼叫的最長時間約 270 秒）、`env = { LOCAL_TTS_MCP_WAIT = "240" }`（每次呼叫等滿 240 秒，長旁白所需的 `get_speech_job` 次數較少；未設時用 45 秒，配合 Codex 預設的 60 秒逾時）與 `default_tools_approval_mode = "approve"`（免核准；未設時每次呼叫都要核准，headless `codex exec` 會直接拒絕）。Claude Code 在 `~/.claude/settings.json` 的 `permissions.allow` 加入 `mcp__local-tts`（未設時第一次呼叫會詢問）。兩者開放後，Agent 可不經詢問在它指定的路徑建立音檔（帶 `overwrite` 時可覆寫）；工具不連外網。
 
 ## Agent 使用規則
 
@@ -148,12 +156,13 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 
 | 方法 | 路徑 | 說明 |
 |---|---|---|
-| GET | `/health` | 服務狀態、已載入模型、佇列長度、執行中工作、GPU 記憶體 |
+| GET | `/health` | 服務狀態、已載入模型、佇列長度、執行中工作、GPU 記憶體、`estimates`（各模型實測的 RTF 與載入秒數） |
 | GET | `/v1/models` | 模型清單：id、是否預設、是否已載入、支援語言、能力、可用選項 |
 | GET | `/v1/voices?model=` | 聲音清單：name、描述、語言、相容模型 |
 | POST | `/v1/audio/speech` | 同步生成，直接回傳音訊 bytes（OpenAI 相容子集） |
 | POST | `/v1/jobs` | 非同步生成，回傳 202 與工作 ID（長旁白用，避免呼叫端逾時） |
-| GET | `/v1/jobs/{id}` | 工作狀態：queued／running／succeeded／failed、佇列位置、段落進度、結果中繼資料或錯誤 |
+| GET | `/v1/jobs/{id}` | 工作狀態：queued／running／succeeded／failed、佇列位置、段落進度、`estimated_remaining_seconds`、結果中繼資料（含 `warnings`、`timeline`）或錯誤 |
+| DELETE | `/v1/jobs/{id}` | 取消工作：排隊中 → 200，工作變為 failed（code `cancelled`）；執行中 → 202（`cancel_requested: true`），在下一段開始前停止；重複取消 → 200；已完成 → 409 `job_finished` |
 | GET | `/v1/jobs/{id}/audio` | 取得完成工作的音訊 |
 
 請求本體（`/v1/audio/speech` 與 `/v1/jobs` 相同）：
@@ -196,13 +205,15 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 | `segment_failed` | 500 | 某段重試後輸出仍異常（過短／空白）；附 `segment` 與 `text` |
 | `model_load_failed` / `gpu_out_of_memory` / `internal_error` | 500 | 生成時發生的例外附 `segment`（段落索引） |
 | `unknown_job` / `job_not_finished` | 404 / 409 | `job_not_finished` 附 `job_status`（queued／running） |
+| `cancelled` | 409 | 工作已被取消（工作狀態為 failed）；需要時重新送出 |
+| `job_finished` | 409 | 取消已完成的工作；附 `job_status` |
 
 ## 長文處理
 
 1. 依句界（`。！？；…`、英文句點）切句，`[...]` 標記不拆；過長的句子再依逗號切
 2. 依估計時長把句子打包成段（預設每段 ≤ 30 秒）
 3. 每段生成上限依估計時長設定（≤ `max_new_tokens`）；達上限視為截斷 → 切成兩半重試（最多 2 層；子段同樣處理邊界 `[pause]` 與參考音色）
-4. 輸出比估計短太多（< 0.3× 估計 − 0.5 秒，視為漏唸）或長太多（> 2.2× 估計 + 3 秒，視為模型唸完後繼續發聲）→ 重試（最多 2 次）；最終失敗回報段落索引（`segment_failed`）。介於 0.3× 與 0.7× 之間（可能漏了一句；實測漏一整句的英文段為 0.66×，129 個正常段落最低 0.75×）也重試，重試後仍偏短時保留最長的一次，不報錯，但在結果的 `warnings` 註明是哪一段。實測正常語音多為估計的 0.75–2.1 倍（中文約 1.5 倍）
+4. 輸出比估計短太多（< 0.3× 估計 − 0.5 秒，視為漏唸）或長太多（> 2.2× 估計 + 3 秒，視為模型唸完後繼續發聲）→ 重試（最多 2 次）；最終失敗回報段落索引（`segment_failed`）。介於 0.3× 與 0.7× 之間（可能漏了一句；實測漏一整句的英文段為 0.66×，129 個正常段落最低 0.75×）也重試，重試後仍偏短時保留最長的一次，不報錯，但在結果的 `warnings` 註明是哪一段，並附該段文字。實測正常語音多為估計的 0.75–2.1 倍（中文約 1.5 倍）
 5. 去除每段首尾靜音後拼接：段間 0.35 秒、段落間 0.8 秒；位於段首尾的 `[pause]` 轉為實際靜音
 6. 有 `voice` 時每段用同一參考音檔；未指定時以第一段（≥ 3 秒）的輸出作為後續段的參考，維持音色一致；在它之前的較短片段（例如標題）會用該參考重新生成一次
 

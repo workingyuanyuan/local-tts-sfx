@@ -147,6 +147,7 @@ def build_app() -> FastAPI:
             "loaded_model": manager.loaded_model, "default_model": registry.default_model,
             **scheduler.stats(), "queue_max": cfg.queue_max,
             "idle_unload_seconds": cfg.idle_unload_seconds,
+            "estimates": scheduler.estimates(),
             "gpu": _gpu_memory(),
         }
 
@@ -186,6 +187,13 @@ def build_app() -> FastAPI:
     @app.get("/v1/jobs/{job_id}")
     def get_job(job_id: str):
         return scheduler.snapshot(scheduler.get(job_id))
+
+    @app.delete("/v1/jobs/{job_id}")
+    def cancel_job(job_id: str):
+        # 200: the job is over (failed with code "cancelled"). 202: it is running and stops before its
+        # next segment; poll it (it may still succeed if its last segment was already being generated).
+        job, stopped = scheduler.cancel(job_id)
+        return JSONResponse(scheduler.snapshot(job), status_code=200 if stopped else 202)
 
     @app.get("/v1/jobs/{job_id}/audio")
     def get_job_audio(job_id: str):
