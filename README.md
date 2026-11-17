@@ -176,8 +176,10 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 
 | Agent | 安裝位置 |
 |---|---|
-| Claude Code | `~/.claude/skills/narration/SKILL.md` 與 `~/.claude/skills/sound-effects/SKILL.md`（user-level skill，依 description 自動觸發） |
-| Codex | `~/.codex/AGENTS.md` 中 `<!-- local-tts:begin -->`…`<!-- local-tts:end -->`（旁白）與 `<!-- local-tts-sfx:begin -->`…`<!-- local-tts-sfx:end -->`（音效）之間的區塊（其餘內容不動；任一組標記不成對時整個檔案都不改並報錯；第一次安裝前備份為 `AGENTS.md.bak-local-tts`） |
+| Claude Code | `~/.claude/skills/narration/SKILL.md` 與 `~/.claude/skills/sound-effects/SKILL.md` |
+| Codex | `~/.codex/skills/narration/SKILL.md` 與 `~/.codex/skills/sound-effects/SKILL.md` |
+
+兩邊是同一份 skill：平常只有 description 一行進入上下文，任務需要旁白或音效時才載入全文。安裝腳本不寫入 `~/.codex/AGENTS.md`；舊版寫在其中 `<!-- local-tts:begin -->`…`<!-- local-tts:end -->` 與 `<!-- local-tts-sfx:begin -->`…`<!-- local-tts-sfx:end -->` 的區塊會被移除（其餘內容不動，先備份為 `AGENTS.md.bak-local-tts`；標記不成對時什麼都不改並報錯）。
 
 規則內容：觸發情境（影片旁白、簡報配音、教材朗讀、有聲內容；只要文字稿時不觸發）、為耳朵寫稿（數字讀法、`[pause]`、拼音修正讀音）、模型與聲音選擇（未指定 `voice` 時每次呼叫音色不同，多段需同一旁白者時固定同一 `voice`）、輸出放在任務專案目錄、依用途切分檔案（每個場景／投影片一檔，用 `generate_speech_clips` 一次生成）、`pending` 時照 `next` 接續、註冊聲音需使用者同意、旁白完成後可 `unload_model`、交給 ffmpeg 合成的方式與錯誤處理。音效規則：何時使用（非語音的聲音；語音用旁白規則，背景音樂與歌曲不適用）、具體描述聲源與動作、`seconds` ≤ 30、同一成品的所有音效用一次 `generate_sound_effect_clips`、旁白與音效分批生成不交錯（切換模型要數十秒）、用 ffmpeg `adelay`／`amix` 自行放到時間軸、用 ffprobe／volumedetect（及可用時的音訊模型）檢查、不符時換 `seed` 或更具體的描述重生成、`pending` 與錯誤的處理、沒有 MCP 時的 CLI。修改規則後重新執行安裝腳本。
 

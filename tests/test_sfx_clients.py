@@ -233,21 +233,29 @@ def test_install_agent_rules_into_a_temporary_home(tmp_path):
     home = tmp_path / "home"
     agents = home / ".codex" / "AGENTS.md"
     agents.parent.mkdir(parents=True)
-    agents.write_text("# My rules\n\nKeep this line.\n")
+    old = ("# My rules\n\nKeep this line.\n\n<!-- local-tts:begin -->\nold narration rules\n<!-- local-tts:end -->\n\n"
+           "# Later\n\nAnd this one.\n\n<!-- local-tts-sfx:begin -->\nold sfx rules\n<!-- local-tts-sfx:end -->\n")
+    agents.write_text(old)
     assert install(home).returncode == 0
-    for skill in ("narration", "sound-effects"):
-        text = (home / ".claude" / "skills" / skill / "SKILL.md").read_text()
-        assert text.startswith(f"---\nname: {skill}\n") and "{{LOCAL_TTS_ROOT}}" not in text
-    first = agents.read_text()
-    assert first.startswith("# My rules\n\nKeep this line.\n")
-    for name in ("local-tts", "local-tts-sfx"):
-        assert first.count(f"<!-- {name}:begin -->") == 1 and first.count(f"<!-- {name}:end -->") == 1
-    assert first.index("<!-- local-tts:end -->") < first.index("<!-- local-tts-sfx:begin -->")
-    assert "generate_sound_effect_clips" in first.split("<!-- local-tts-sfx:begin -->")[1]
-    assert (agents.parent / "AGENTS.md.bak-local-tts").read_text() == "# My rules\n\nKeep this line.\n"
-    agents.write_text(first + "\nAdded later.\n")
-    assert install(home).returncode == 0  # idempotent: blocks replaced in place, the rest kept
-    assert agents.read_text() == first + "\nAdded later.\n"
+    for target in (".claude", ".codex"):  # the same skills for both agents, loaded only when a task needs them
+        for skill in ("narration", "sound-effects"):
+            text = (home / target / "skills" / skill / "SKILL.md").read_text()
+            assert text.startswith(f"---\nname: {skill}\n") and "{{LOCAL_TTS_ROOT}}" not in text
+    # the blocks earlier versions wrote are gone, everything else is kept, and the original is backed up
+    assert agents.read_text() == "# My rules\n\nKeep this line.\n\n# Later\n\nAnd this one.\n"
+    assert (agents.parent / "AGENTS.md.bak-local-tts").read_text() == old
+    assert install(home).returncode == 0  # idempotent
+    assert agents.read_text() == "# My rules\n\nKeep this line.\n\n# Later\n\nAnd this one.\n"
+
+
+def test_install_agent_rules_never_creates_or_touches_agents_md_without_blocks(tmp_path):
+    home = tmp_path / "home"
+    assert install(home).returncode == 0
+    assert not (home / ".codex" / "AGENTS.md").exists()
+    agents = home / ".codex" / "AGENTS.md"
+    agents.write_text("mine\n")
+    assert install(home).returncode == 0
+    assert agents.read_text() == "mine\n" and not (agents.parent / "AGENTS.md.bak-local-tts").exists()
 
 
 @pytest.mark.parametrize("broken", ["<!-- local-tts-sfx:begin -->\nhalf\n",
@@ -270,12 +278,8 @@ def snapshot(root: Path) -> dict[str, bytes]:
 
 
 @pytest.mark.parametrize("broken", [
-    # an unmatched sound-effects begin marker hidden inside the narration block
-    "<!-- local-tts:begin -->\nold\n<!-- local-tts-sfx:begin -->\n<!-- local-tts:end -->\n",
     # two well-formed pairs that overlap
     "<!-- local-tts:begin -->\na\n<!-- local-tts-sfx:begin -->\nb\n<!-- local-tts:end -->\nc\n<!-- local-tts-sfx:end -->\n",
-    # one pair nested inside the other
-    "<!-- local-tts:begin -->\n<!-- local-tts-sfx:begin -->\n<!-- local-tts-sfx:end -->\n<!-- local-tts:end -->\n",
     "<!-- local-tts-sfx:begin -->\nhalf\n"])
 def test_install_refusal_leaves_home_untouched(tmp_path, broken):
     home = tmp_path / "home"
@@ -349,7 +353,7 @@ def test_warnings_sentence_is_about_speech():
 
 
 def test_rule_texts_keep_the_timeline_and_fetch_unwritten_clips():
-    for rel in ("agent-rules/claude/sound-effects/SKILL.md", "agent-rules/codex/AGENTS.local-tts-sfx.md"):
+    for rel in ("agent-rules/skills/sound-effects/SKILL.md",):
         text = (ROOT / rel).read_text()
         assert "duration=first" not in text and "duration=longest" in text and "normalize=0" in text
         assert '"delivery"' in text and "recovery" in text

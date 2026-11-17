@@ -26,7 +26,7 @@ Agent ──MCP stdio──▶ tts-mcp ─┐
 | `src/local_tts/client.py` | CLI 與 MCP 共用的 HTTP client：寫檔、路徑、期限、重試 |
 | `src/local_tts/cli.py`、`mcp_server.py` | `tts` CLI 與 `tts-mcp` |
 | `config/` | 伺服器設定、模型與聲音註冊表 |
-| `agent-rules/` | 給使用者的 Agent 的使用規則原稿（旁白 `narration`、音效 `sound-effects`，Codex 各一個標記區塊），由 `scripts/install_agent_rules.sh` 安裝 |
+| `agent-rules/` | 給使用者的 Agent 的使用規則原稿（skill：旁白 `narration`、音效 `sound-effects`），由 `scripts/install_agent_rules.sh` 安裝到 Claude Code 與 Codex 的 skills 目錄；不寫入 `~/.codex/AGENTS.md`（那會載入每個專案的上下文） |
 | `tests/` | 單元測試（假 adapter，不需 GPU） |
 | `scripts/` | 實測與驗收腳本（需要執行中的服務與 GPU） |
 | `docs/` | 開發各步的實測報告與審查紀錄 |
