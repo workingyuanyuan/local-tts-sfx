@@ -749,12 +749,12 @@ def test_cancel_running_job_stops_before_next_segment(tts, client, tmp_path):
         time.sleep(0.02)
     r = client.delete(f"/v1/jobs/{jid}")
     assert r.status_code == 202 and r.json()["cancel_requested"] is True
-    GATE.set()  # the first segment finishes; the second is never generated
+    GATE.set()  # the first generation returns and is discarded; the second never starts
     while client.get(f"/v1/jobs/{jid}").json()["status"] == "running" and time.time() < end:
         time.sleep(0.02)
     j = client.get(f"/v1/jobs/{jid}").json()
     assert j["status"] == "failed" and j["error"]["code"] == "cancelled"
-    assert j["progress"]["segments_done"] == 1
+    assert j["progress"]["segments_done"] == 0  # the segment in progress was discarded, not reported done
     assert client.delete(f"/v1/jobs/{jid}").status_code == 200
 
 

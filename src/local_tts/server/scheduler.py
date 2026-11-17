@@ -293,7 +293,7 @@ class Scheduler:
                 "content_type": FORMATS[req.response_format], "bytes": len(audio),
                 "model": req.model.id, "voice": req.voice.name if req.voice else None,
                 "language": req.language, "segments": res.segments, "retries": res.retries,
-                "splits": res.splits, "synthesis_seconds": round(elapsed, 2),
+                "splits": res.splits, "batch_size": res.batch_size, "synthesis_seconds": round(elapsed, 2),
                 "rtf": round(elapsed / res.duration, 3) if res.duration else None,
                 "warnings": res.warnings, "timeline": res.timeline,
             }

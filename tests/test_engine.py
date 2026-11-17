@@ -305,3 +305,137 @@ def test_cancel_stops_before_the_next_generation():
     with pytest.raises(TTSError) as e:
         synthesize(adapter, req, SegmentingConfig(), progress, cancelled=lambda: flag["on"])
     assert e.value.code == "cancelled" and len(adapter.calls) == 1
+
+
+# --- batched first attempts ------------------------------------------------------------------------
+
+from pathlib import Path  # noqa: E402
+
+from local_tts.config import VoiceEntry  # noqa: E402
+
+PARAS = "\n\n".join(f"第{i}段的內容在這裡，這是稍微長一點的句子。" for i in range(9))
+VOICE = VoiceEntry("v", "", "zh", Path("/nonexistent.wav"), ["fake"])
+
+
+class OutOfMemoryError(RuntimeError):
+    """Named like torch.cuda.OutOfMemoryError (the engine matches the class name)."""
+
+
+class BatchFake(FakeAdapter):
+    supports_batch = True
+
+    def __init__(self, behaviour, batch_size, batch_error=None):
+        super().__init__(behaviour)
+        self.entry.options["batch_size"] = batch_size
+        self.batches = []  # texts of every generate_batch call
+        self.batch_error = batch_error
+        self.released = 0
+
+    def release_cache(self):
+        self.released += 1
+
+    def generate_batch(self, texts, *, language, reference, max_frames, seed):
+        self.batches.append(list(texts))
+        if self.batch_error is not None:
+            raise self.batch_error
+        return [self.generate(t, language=language, reference=reference, max_frames=m, seed=seed)
+                for t, m in zip(texts, max_frames)]
+
+
+def run_with(adapter, text, voice=None, cancelled=None, **cfg):
+    req = SynthesisRequest(model=adapter.entry, voice=voice, text=text, language="zh")
+    return synthesize(adapter, req, SegmentingConfig(**cfg), cancelled=cancelled)
+
+
+def test_batches_cover_first_attempts_and_match_serial_output():
+    serial = run_with(FakeAdapter(lambda t, i: "ok"), PARAS, voice=VOICE)
+    a = BatchFake(lambda t, i: "ok", 4)
+    batched = run_with(a, PARAS, voice=VOICE)
+    assert [len(b) for b in a.batches] == [4, 4]  # segment 8 is left alone (a batch of one is pointless)
+    assert len(a.calls) == 9  # every segment generated exactly once
+    assert np.array_equal(serial.audio, batched.audio) and serial.timeline == batched.timeline
+    assert batched.batch_size == 4
+
+
+def test_failed_batch_members_are_retried_and_split_like_single_generations():
+    def behaviour(counts):
+        def f(t, i):
+            counts[t] = counts.get(t, 0) + 1
+            if t == "第1段的內容在這裡，這是稍微長一點的句子。" and counts[t] == 1:
+                return "truncate"
+            if t == "第2段的內容在這裡，這是稍微長一點的句子。" and counts[t] == 1:
+                return "short"
+            return "ok"
+        return f
+    serial = run_with(FakeAdapter(behaviour({})), PARAS, voice=VOICE)
+    a = BatchFake(behaviour({}), 4)
+    batched = run_with(a, PARAS, voice=VOICE)
+    assert (batched.retries, batched.splits) == (serial.retries, serial.splits) == (1, 1)
+    assert np.array_equal(serial.audio, batched.audio) and serial.timeline == batched.timeline
+
+
+def test_unvoiced_batches_start_after_the_reference_and_rerender_early_pieces():
+    text = "標題。\n\n" + PARAS
+    a = BatchFake(lambda t, i: "ok", 4)
+    res = run_with(a, text)
+    first_batch = a.batches[0]
+    assert first_batch[0].startswith("第1段")  # title and segment 0 (the reference) were rendered alone
+    assert [t for t, _ in a.calls].count("標題。") == 2  # the short title was re-rendered with the reference
+    assert all(ref is not None for t, ref in a.calls[2:])
+    assert len(res.timeline) == 10
+
+
+def test_out_of_memory_batch_falls_back_to_single_generations():
+    a = BatchFake(lambda t, i: "ok", 4, batch_error=OutOfMemoryError("CUDA out of memory"))
+    res = run_with(a, PARAS, voice=VOICE)
+    assert len(a.batches) == 1 and a.released == 1  # batching is switched off for the rest of the job
+    assert len(a.calls) == 9 and res.batch_size == 1
+    one = run_with(BatchFake(lambda t, i: "ok", 4), "只有一段。", voice=VOICE)
+    assert one.batch_size == 1  # nothing to batch
+
+
+def test_other_batch_errors_are_reported_with_the_segment():
+    a = BatchFake(lambda t, i: "ok", 4, batch_error=RuntimeError("boom"))
+    with pytest.raises(RuntimeError) as e:
+        run_with(a, PARAS, voice=VOICE)
+    assert e.value.tts_segment == 0
+
+
+def test_cancel_during_a_batch_discards_it():
+    flag = {"on": False}
+
+    class Cancelling(BatchFake):
+        def generate_batch(self, *args, **kw):
+            flag["on"] = True
+            return super().generate_batch(*args, **kw)
+    a = Cancelling(lambda t, i: "ok", 4)
+    with pytest.raises(TTSError) as e:
+        run_with(a, PARAS, voice=VOICE, cancelled=lambda: flag["on"])
+    assert e.value.code == "cancelled" and len(a.batches) == 1
+
+
+def test_batch_size_one_never_batches():
+    a = BatchFake(lambda t, i: "ok", 1)
+    run_with(a, PARAS, voice=VOICE)
+    assert a.batches == []
+
+
+def test_item_codes_skip_prompt_and_rows_after_the_end():
+    from local_tts.adapters.moss_local import item_codes
+    pad = 7
+    rows = torch.tensor([[1, pad, pad],    # audio-start row
+                         [2, 3, 4],        # generated
+                         [2, 5, 6],        # generated
+                         [0, pad, pad],    # after this row finished (batch kept going)
+                         [0, pad, pad]])
+    assert item_codes(rows, 0, pad).tolist() == [[3, 4], [5, 6]]
+    assert item_codes(rows, 1, pad).tolist() == [[5, 6]]  # one prompt row after the start row
+
+
+def test_cancel_after_a_batch_stops_before_using_later_results():
+    a = BatchFake(lambda t, i: "ok", 4)
+    done = []
+    req = SynthesisRequest(model=a.entry, voice=VOICE, text=PARAS, language="zh")
+    with pytest.raises(TTSError) as e:
+        synthesize(a, req, SegmentingConfig(), lambda d, t: done.append(d), cancelled=lambda: bool(done))
+    assert e.value.code == "cancelled" and done == [1] and len(a.batches) == 1

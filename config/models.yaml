@@ -20,3 +20,8 @@ models:
     # Hard upper bound on frames per segment (12.5 frames/s). Per-segment budgets are derived
     # from the estimated duration and never exceed this.
     max_new_tokens: 4096
+    # Segments whose first attempt is generated in one batch once the voice is fixed (1 = off). B=4 was
+    # ~2.4x and B=8 ~3.5x faster for +0.7 / +1.6-2.1 GiB of GPU memory (docs/batch-bench-report.md);
+    # a batch that runs out of memory falls back to one segment at a time. The same seed reproduces
+    # the same audio only with the same batch_size. Override per machine with LOCAL_TTS_BATCH_SIZE.
+    batch_size: 1

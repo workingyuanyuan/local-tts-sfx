@@ -24,11 +24,19 @@ LANGUAGES = {
 }
 
 
+def item_codes(generation_ids: torch.Tensor, start_length: int, audio_pad: int) -> torch.Tensor:
+    """The audio codes one batch row generated: rows after the audio-start row and the prompt, audio
+    channels only, without the all-padding rows of a row that finished before the rest of the batch."""
+    codes = generation_ids[1 + int(start_length):, 1:]
+    return codes[~codes.eq(audio_pad).all(dim=1)]
+
+
 class MossLocalAdapter(Adapter):
     languages = LANGUAGES
     capabilities = {"clone": True, "pause_marker": True, "pinyin": True, "continuation": False}
     frames_per_second = 12.5
     supported_options = {"language", "seed"}
+    supports_batch = True
 
     def __init__(self, entry):
         super().__init__(entry)
@@ -121,4 +129,42 @@ class MossLocalAdapter(Adapter):
         codes = codes[~codes.eq(int(p.model_config.audio_pad_token_id)).all(dim=1)]
         return SegmentAudio(audio=audio, sample_rate=sr, frames=frames, truncated=frames >= max_frames,
                             reference=codes[:MAX_SEGMENT_REFERENCE_FRAMES].contiguous() if len(codes) else None)
+
+    def generate_batch(self, texts: list[str], *, language: Optional[str], reference: Any,
+                       max_frames: list[int], seed: Optional[int]) -> list[SegmentAudio]:
+        # Measured in docs/batch-bench-report.md. The processor left-pads with an attention mask and
+        # the decoder derives positions from it; each row stops on its own end token, but the call
+        # runs until every row has ended or the largest budget is used up.
+        p = self.processor
+        lang = LANGUAGES[language] if language else None
+        conversations = [[p.build_user_message(text=t, reference=None if reference is None else [reference],
+                                               language=lang)] for t in texts]
+        if seed is not None:
+            torch.manual_seed(seed)
+        pad = int(p.model_config.audio_pad_token_id)
+        with torch.no_grad():
+            batch = p(conversations, mode="generation")
+            outputs = self.model.generate(
+                input_ids=batch["input_ids"].to("cuda"),
+                attention_mask=batch["attention_mask"].to("cuda"),
+                max_new_tokens=max(max_frames),
+                do_sample=True,
+                **self.entry.options["sampling"],
+            )
+            messages = p.decode(outputs)
+        sr = int(p.model_config.sampling_rate)
+        results = []
+        for (start_length, generation_ids), message, budget in zip(outputs, messages, max_frames):
+            codes = item_codes(generation_ids, start_length, pad)
+            frames = int(codes.shape[0])
+            wavs = [] if message is None else [w for w in message.audio_codes_list if w.numel()]
+            audio = torch.cat(wavs, dim=-1).float().cpu().numpy() if wavs else torch.zeros(2, 0).numpy()
+            # A row that ran past its own budget (possible while a longer row keeps the batch going)
+            # counts as truncated, as it would have alone.
+            results.append(SegmentAudio(audio=audio, sample_rate=sr, frames=frames, truncated=frames >= budget,
+                                        reference=codes[:MAX_SEGMENT_REFERENCE_FRAMES].contiguous()
+                                        if frames else None))
+        if len(results) != len(texts):
+            raise RuntimeError(f"batch of {len(texts)} texts returned {len(results)} results")
+        return results
 

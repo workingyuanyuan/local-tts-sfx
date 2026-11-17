@@ -261,8 +261,8 @@ async def _cancel(job_id) -> dict[str, Any]:
     if job["status"] == "failed":
         return {"status": "cancelled", "job_id": job_id}
     return {"status": "cancelling", "job_id": job_id, "job_status": job["status"],
-            "message": "The job stops before its next segment. If its last segment was already being "
-                       "generated it may still complete; get_speech_job shows the outcome."}
+            "message": "The job stops as soon as the segment (or batch of segments) being generated "
+                       "finishes; nothing is written."}
 
 
 async def _run(fn, *args) -> Any:
@@ -346,7 +346,7 @@ async def get_speech_job(
 async def cancel_speech_job(job_id: str) -> dict[str, Any]:
     """Cancel a generate_speech job you no longer need (wrong text, superseded script), so the GPU and
     queue are free for the next one. A queued job stops at once ("cancelled"); a running one stops
-    before its next segment ("cancelling"). No file is written. Cancelling a job that already
+    when the segment (or batch) being generated finishes ("cancelling"). No file is written. Cancelling a job that already
     completed is an error (job_finished)."""
     return await _run(_cancel, job_id)
 

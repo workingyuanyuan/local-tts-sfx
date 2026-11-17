@@ -97,11 +97,25 @@ def load_server_config() -> ServerConfig:
     return cfg
 
 
+def _batch_size(model_id: str, value: Any, source: str) -> int:
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        size = 0
+    if size < 1 or str(value).strip() != str(size):
+        raise ValueError(f"model '{model_id}': batch_size from {source} must be a positive integer, got {value!r}")
+    return size
+
+
 def load_registry() -> Registry:
     raw_models = _read_yaml("models.yaml")
     models = {}
+    # A machine with spare GPU memory can batch without editing the tracked models.yaml.
+    override = os.environ.get("LOCAL_TTS_BATCH_SIZE")
     for model_id, m in raw_models.get("models", {}).items():
         m = dict(m)
+        m["batch_size"] = (_batch_size(model_id, override, "LOCAL_TTS_BATCH_SIZE") if override is not None
+                           else _batch_size(model_id, m.get("batch_size", 1), "models.yaml"))
         models[model_id] = ModelEntry(id=model_id, adapter=m.pop("adapter"),
                                       description=m.pop("description", ""), options=m)
     default = raw_models.get("default")

@@ -9,7 +9,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from local_tts.adapters import adapter_class
-from local_tts.adapters.base import Adapter
+from local_tts.adapters.base import Adapter, SegmentAudio
 from local_tts.audio import silence, trim_silence
 from local_tts.config import ModelEntry, Registry, SegmentingConfig, VoiceEntry
 from local_tts.errors import TTSError
@@ -40,6 +40,11 @@ class ModelManager:
         self.adapters: dict[str, Adapter] = {
             m.id: adapter_class(m.adapter)(m) for m in registry.models.values()
         }
+        for a in self.adapters.values():
+            size = int(a.entry.options.get("batch_size", 1))
+            if size > 1 and not a.supports_batch:
+                raise ValueError(f"model '{a.entry.id}': batch_size is {size}, but adapter '{a.entry.adapter}' "
+                                 "cannot generate in batches; set batch_size: 1")
         self.current: Optional[Adapter] = None
         self.lock = threading.Lock()
         # Wall-clock seconds of the most recent acquire() that actually loaded a model (else None).
@@ -118,6 +123,8 @@ class SynthesisResult:
     retries: int = 0
     splits: int = 0
     warnings: list[str] = field(default_factory=list)
+    # The largest batch actually generated (1 = no batching, e.g. a single segment or out of memory at once).
+    batch_size: int = 1
     # One entry per top-level segment: {"index", "paragraph", "start", "end", "text"} (seconds).
     timeline: list[dict[str, Any]] = field(default_factory=list)
 
@@ -150,6 +157,12 @@ class _Synthesis:
         # Shorter pieces rendered before that (e.g. a title) are re-rendered with the reference once it
         # exists, so the whole result keeps one voice: (slot, text, seg_index, depth, seed).
         self.early: list[tuple[list, str, int, int, Optional[int]]] = []
+        # Batching: the first attempts of up to `batch_size` upcoming top-level segments are generated in
+        # one call once the reference voice is fixed; each result is then checked (and retried or split)
+        # by _render exactly like a single generation. index -> first attempt.
+        self.batch_size = max(1, int(adapter.entry.options.get("batch_size", 1)))
+        self.prefetched: dict[int, SegmentAudio] = {}
+        self.largest_batch = 1  # reported: the largest batch actually generated
 
     def _budget(self, text: str) -> int:
         est = estimate_seconds(text)
@@ -160,6 +173,43 @@ class _Synthesis:
     def _silence(self, seconds: float) -> np.ndarray:
         return silence(self.channels, self.sample_rate, seconds)
 
+    def _check_cancel(self) -> None:
+        if self.cancelled is not None and self.cancelled():
+            raise Cancelled()
+
+    def _prefetch(self, segments: list[Segment], i: int, seed: Optional[int]) -> None:
+        """Generate the first attempts of segments i, i+1, ... (up to batch_size) in one call."""
+        if self.batch_size < 2 or i in self.prefetched:
+            return
+        if self.follow_first and self.reference is None:
+            return  # the reference voice is not known yet: these pieces must be rendered one by one
+        idx = list(range(i, min(i + self.batch_size, len(segments))))
+        if len(idx) < 2:
+            return
+        texts = [segments[j].text for j in idx]
+        self._check_cancel()
+        oom = False
+        try:
+            results = self.adapter.generate_batch(
+                texts, language=self.req.language, reference=self.reference,
+                max_frames=[self._budget(t) for t in texts], seed=None if seed is None else seed + 1000 * (i + 1))
+        except Exception as e:
+            if type(e).__name__ != "OutOfMemoryError":
+                if not isinstance(e, TTSError) and not hasattr(e, "tts_segment"):
+                    e.tts_segment = idx[0]
+                raise
+            oom = True
+        if oom:  # handled outside the except block, so no traceback keeps the batch's tensors alive
+            log.warning("a batch of %d segments ran out of GPU memory; generating one segment at a time "
+                        "for the rest of this job", len(idx))
+            self.batch_size = 1
+            self.adapter.release_cache()
+            return
+        self._check_cancel()
+        log.info("segments %d-%d: first attempts generated as one batch", idx[0], idx[-1])
+        self.prefetched.update(zip(idx, results))
+        self.largest_batch = max(self.largest_batch, len(idx))
+
     def _sequence(self, segments: list[Segment], seg_index: Optional[int], depth: int,
                   seed: Optional[int]) -> list[list[np.ndarray]]:
         """Render segments in order with gaps; edge [pause] silences are kept. `seg_index` is the
@@ -169,7 +219,11 @@ class _Synthesis:
         for i, seg in enumerate(segments):
             index = i if seg_index is None else seg_index
             s = None if seed is None else seed + (1000 if seg_index is None else 100) * (i + 1)
-            slots = self._render(seg.text, index, depth, s)
+            first = None
+            if seg_index is None:
+                self._prefetch(segments, i, seed)
+                first = self.prefetched.pop(i, None)
+            slots = self._render(seg.text, index, depth, s, first)
             gap = seg.lead_silence
             if i > 0:
                 prev = segments[i - 1]
@@ -184,22 +238,28 @@ class _Synthesis:
             out.append([self._silence(segments[-1].trail_silence), None])
         return out
 
-    def _render(self, text: str, seg_index: int, depth: int, seed: Optional[int]) -> list[list[np.ndarray]]:
-        """Generate one piece of text; on truncation split it and render the halves."""
+    def _render(self, text: str, seg_index: int, depth: int, seed: Optional[int],
+                first: Optional[SegmentAudio] = None) -> list[list[np.ndarray]]:
+        """Generate one piece of text; on truncation split it and render the halves. `first` is an
+        attempt already generated in a batch, used as attempt 0."""
         est = estimate_seconds(text)
         last_problem = ""
         best = None  # (dur, audio, reference): the longest suspiciously short attempt
         for attempt in range(self.cfg.max_retries + 1):
             s = None if seed is None else seed + attempt
-            if self.cancelled is not None and self.cancelled():
-                raise Cancelled()
-            try:
-                r = self.adapter.generate(text, language=self.req.language, reference=self.reference,
-                                          max_frames=self._budget(text), seed=s)
-            except Exception as e:
-                if not isinstance(e, TTSError) and not hasattr(e, "tts_segment"):
-                    e.tts_segment = seg_index  # the scheduler reports which segment crashed (e.g. OOM)
-                raise
+            if attempt == 0 and first is not None:
+                self._check_cancel()  # a batch may hold results for segments after the cancel
+                r = first
+            else:
+                self._check_cancel()
+                try:
+                    r = self.adapter.generate(text, language=self.req.language, reference=self.reference,
+                                              max_frames=self._budget(text), seed=s)
+                except Exception as e:
+                    if not isinstance(e, TTSError) and not hasattr(e, "tts_segment"):
+                        e.tts_segment = seg_index  # the scheduler reports which segment crashed (e.g. OOM)
+                    raise
+                self._check_cancel()  # do not spend more work (or report success) after a cancel
             self.sample_rate, self.channels = r.sample_rate, r.audio.shape[0] or 2
             if r.truncated:
                 parts = split_finer(text)
@@ -271,7 +331,7 @@ class _Synthesis:
         audio = np.concatenate([x[0] for x in slots], axis=1)
         return SynthesisResult(audio=audio, sample_rate=self.sample_rate, segments=len(segments),
                                retries=self.retries, splits=self.splits, warnings=[w for _, w in self.warnings],
-                               timeline=self._timeline(segments, slots))
+                               batch_size=self.largest_batch, timeline=self._timeline(segments, slots))
 
     def _timeline(self, segments: list[Segment], slots: list[list]) -> list[dict[str, Any]]:
         """Where each top-level segment's speech starts and ends in the final audio (gaps excluded)."""

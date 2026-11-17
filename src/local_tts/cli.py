@@ -155,7 +155,7 @@ async def cmd_cancel(c: TTSClient, a) -> int:
         _print({"status": "cancelled", "job_id": a.job_id}, a.json, f"cancelled: job {a.job_id}")
     else:
         _print({"status": "cancelling", "job_id": a.job_id, "job_status": job["status"]}, a.json,
-               f"cancelling: job {a.job_id} stops before its next segment")
+               f"cancelling: job {a.job_id} stops when the segment being generated finishes")
     return 0
 
 

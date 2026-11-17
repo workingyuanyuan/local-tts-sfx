@@ -25,6 +25,8 @@ class Adapter(ABC):
     frames_per_second: float = 12.5
     # Per-request options (beyond model/input/voice/response_format) this adapter accepts.
     supported_options: set[str] = set()
+    # Whether generate_batch() is implemented (required for batch_size > 1 in models.yaml).
+    supports_batch: bool = False
 
     def __init__(self, entry: ModelEntry):
         self.entry = entry
@@ -49,6 +51,13 @@ class Adapter(ABC):
     @abstractmethod
     def generate(self, text: str, *, language: Optional[str], reference: Any,
                  max_frames: int, seed: Optional[int]) -> SegmentAudio: ...
+
+    def generate_batch(self, texts: list[str], *, language: Optional[str], reference: Any,
+                       max_frames: list[int], seed: Optional[int]) -> list[SegmentAudio]:
+        """Generate several independent texts (same language and reference) in one call; one result
+        per text, in order, each judged against its own max_frames. One seed covers the whole call, so
+        output depends on the batch's composition. Adapters that implement it set supports_batch."""
+        raise NotImplementedError(f"adapter for '{self.entry.id}' cannot generate in batches")
 
     def normalize_language(self, language: Optional[str]) -> Optional[str]:
         """Accept a language code or name (case-insensitive); return the code."""

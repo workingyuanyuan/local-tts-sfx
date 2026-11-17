@@ -95,6 +95,7 @@ def build_app() -> FastAPI:
             "loaded": manager.loaded_model == model_id,
             "languages": sorted(adapter.languages), "capabilities": adapter.capabilities,
             "options": sorted(adapter.supported_options),
+            "batch_size": int(entry.options.get("batch_size", 1)),
         }
 
     def to_request(body: SpeechRequest) -> SynthesisRequest:
@@ -190,8 +191,8 @@ def build_app() -> FastAPI:
 
     @app.delete("/v1/jobs/{job_id}")
     def cancel_job(job_id: str):
-        # 200: the job is over (failed with code "cancelled"). 202: it is running and stops before its
-        # next segment; poll it (it may still succeed if its last segment was already being generated).
+        # 200: the job is over (failed with code "cancelled"). 202: it is running and fails with code
+        # "cancelled" as soon as the generation in progress (one segment or one batch) returns.
         job, stopped = scheduler.cancel(job_id)
         return JSONResponse(scheduler.snapshot(job), status_code=200 if stopped else 202)
 

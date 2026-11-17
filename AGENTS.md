@@ -65,6 +65,7 @@ Agent ──MCP stdio──▶ tts-mcp ─┐
 - 模型與 tokenizer 的 HF revision 固定在 `config/models.yaml`。權重放在 HF 預設快取（`~/.cache/huggingface/`），不放進 repo。
 - MOSS-TTS 是固定 commit 的 submodule（`third_party/MOSS-TTS`）。套件由 `uv.lock` 鎖定：改相依要用 `uv lock`，安裝用 `uv sync --frozen`。
 - 官方取樣參數寫在 `models.yaml`，沒有實測依據不要改。
+- 批次生成（`batch_size`）在 repo 預設為 1（關閉），由各機器以 `LOCAL_TTS_BATCH_SIZE` 開啟；依據與限制見 `docs/batch-bench-report.md`。批次只用於參考音色確定後各段的第一次生成，重試與切分一律逐段；批次顯存不足時退回逐段，不報錯。
 
 ## 可攜性
 

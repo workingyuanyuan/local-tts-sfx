@@ -190,3 +190,34 @@ def test_results_budget_also_applies_when_storing(client):
     err = wait_status(client, jid, {"failed"})["error"]
     assert err["code"] == "results_full" and err["result_bytes"] > 10
     assert all(j.audio is None for j in sched.jobs.values())
+
+
+def test_batch_size_config_and_env_override(monkeypatch, tmp_path):
+    import pytest
+    from local_tts import config as config_module
+    from local_tts.engine import ModelManager
+    (tmp_path / "models.yaml").write_text((config_module.CONFIG_DIR / "models.yaml").read_text())
+    (tmp_path / "voices.yaml").write_text("voices: {}\n")
+    monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
+    monkeypatch.delenv("LOCAL_TTS_BATCH_SIZE", raising=False)
+    reg = config_module.load_registry()
+    assert reg.models[reg.default_model].options["batch_size"] == 1  # the repo default: off
+    monkeypatch.setenv("LOCAL_TTS_BATCH_SIZE", "4")
+    reg = config_module.load_registry()
+    assert reg.models[reg.default_model].options["batch_size"] == 4
+    ModelManager(reg)  # the MOSS adapter can batch
+    for bad in ("0", "-1", "2.5", "four"):
+        monkeypatch.setenv("LOCAL_TTS_BATCH_SIZE", bad)
+        with pytest.raises(ValueError, match="batch_size"):
+            config_module.load_registry()
+
+
+def test_batch_size_rejected_for_adapters_that_cannot_batch(monkeypatch, tmp_path):
+    import pytest
+    from local_tts import config as config_module
+    from local_tts.adapters import ADAPTERS
+    from local_tts.engine import ModelManager
+    monkeypatch.setitem(ADAPTERS, "moss_local", "tests.fakes:GatedAdapter")  # supports_batch = False
+    monkeypatch.setenv("LOCAL_TTS_BATCH_SIZE", "4")
+    with pytest.raises(ValueError, match="cannot generate in batches"):
+        ModelManager(config_module.load_registry())

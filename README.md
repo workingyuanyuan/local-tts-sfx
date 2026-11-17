@@ -102,7 +102,7 @@ tts models | tts voices [-m MODEL] | tts health
 - exit code：0 完成、1 錯誤、2 用法錯誤、3 仍在處理（`--no-wait` 或 `--timeout` 到期，工作會繼續執行）
 - 工作送出後的錯誤附 `job_id`、`output_path` 與 `fetch_command`（接續等待用）；工作本身失敗（`job_status: "failed"`）或服務已不認得該工作（`unknown_job`，服務重啟或過期）時不附 `fetch_command`，需修正後重新送出（`tts say` 與 `tts job` 皆同）
 - `--timeline`（`say`、`job`）：結果另附每段的時間軸（見 MCP 的 `timeline`）；`fetch_command` 會保留這個選項
-- `tts cancel`：排隊中的工作立即取消（印出 `cancelled`）；執行中的工作在下一段開始前停止（印出 `cancelling`）
+- `tts cancel`：排隊中的工作立即取消（印出 `cancelled`）；執行中的工作在正在生成的那一段（或那一批）完成時停止（印出 `cancelling`）
 - 環境變數：`LOCAL_TTS_URL`（服務位址）、`LOCAL_TTS_OUTPUT_DIR`（預設輸出目錄）
 
 ## MCP：`tts-mcp`
@@ -113,7 +113,7 @@ stdio MCP server（`.venv/bin/tts-mcp`）。工具：
 |---|---|
 | `generate_speech` | `text`、`output_path`（絕對路徑）、`language`、`voice`、`model`、`format`、`overwrite`、`seed`、`timeline`、`wait_seconds`。完成時回傳 path、duration_seconds、sample_rate、channels、format、model、voice、segments；有段落偏短（可能漏句）時另附 `warnings`（含該段文字）；`timeline=true` 時另附 `timeline` |
 | `get_speech_job` | 等待 `pending` 的工作並寫檔；重複呼叫回傳同一結果；也接受 `timeline` |
-| `cancel_speech_job` | 取消工作：排隊中立即取消（`cancelled`），執行中在下一段開始前停止（`cancelling`；若最後一段已在生成，仍可能完成）；不寫檔；已完成的工作回 `job_finished` |
+| `cancel_speech_job` | 取消工作：排隊中立即取消（`cancelled`），執行中在正在生成的那一段（或那一批）完成時停止並捨棄（`cancelling`）；不寫檔；已完成的工作回 `job_finished` |
 | `list_models` / `list_voices` / `tts_status` | 唯讀查詢 |
 
 `timeline`：每段一筆 `{index, paragraph, start, end, text}`（秒，相對於輸出檔；不含段間靜音）。段落（空行）一定從新的一段開始，所以一次長呼叫也能依段落切分影片或投影片。預設不回傳，因為它會重複整份輸入文字。`pending` 結果的 `next.arguments` 與錯誤的 `recovery` 會保留 `timeline`。
@@ -145,10 +145,12 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | 檔案 | 內容 |
 |---|---|
 | `config/server.yaml` | 監聽位址／埠（預設 `127.0.0.1:8765`）、佇列上限、閒置卸載秒數、工作保留時間、同步等待上限、切段參數 |
-| `config/models.yaml` | 模型註冊表（`default`、adapter、HF revision、codec 精度、取樣參數） |
+| `config/models.yaml` | 模型註冊表（`default`、adapter、HF revision、codec 精度、取樣參數、`batch_size`） |
 | `config/voices.yaml` | 聲音註冊表（名稱、描述、語言、參考音檔、相容模型） |
 
-環境變數：`LOCAL_TTS_CONFIG_DIR`（改用其他設定目錄）、`LOCAL_TTS_PORT`。
+環境變數：`LOCAL_TTS_CONFIG_DIR`（改用其他設定目錄）、`LOCAL_TTS_PORT`、`LOCAL_TTS_BATCH_SIZE`（覆寫所有模型的 `batch_size`）。
+
+批次生成：`batch_size`（預設 1，即關閉）大於 1 時，參考音色確定後，接下來最多 `batch_size` 段的第一次生成會放進同一次批次；每段仍各自做截斷、漏唸、偏短與持續發聲的判定，需要重試或切分的段落改為逐段處理。實測 B=4 約快 2.4 倍、B=8 約快 3.5 倍，顯存多約 0.7／1.6–2.1 GiB（`docs/batch-bench-report.md`）。批次因顯存不足失敗時，該工作其餘部分改為逐段生成，不會報錯。同一個 `seed` 只在相同 `batch_size` 下產生相同音訊。顯存充足的機器可不改 repo，用 systemd drop-in 設定：`systemctl --user edit local-tts`，加入 `[Service]` 與 `Environment=LOCAL_TTS_BATCH_SIZE=4`。
 
 新增聲音：把參考音檔（幾秒鐘清楚的單人語音，wav/mp3/flac 皆可）放到 `assets/voices/`，在 `voices.yaml` 加一筆，重啟服務。
 
@@ -157,12 +159,12 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | 方法 | 路徑 | 說明 |
 |---|---|---|
 | GET | `/health` | 服務狀態、已載入模型、佇列長度、執行中工作、GPU 記憶體、`estimates`（各模型實測的 RTF 與載入秒數） |
-| GET | `/v1/models` | 模型清單：id、是否預設、是否已載入、支援語言、能力、可用選項 |
+| GET | `/v1/models` | 模型清單：id、是否預設、是否已載入、支援語言、能力、可用選項、`batch_size` |
 | GET | `/v1/voices?model=` | 聲音清單：name、描述、語言、相容模型 |
 | POST | `/v1/audio/speech` | 同步生成，直接回傳音訊 bytes（OpenAI 相容子集） |
 | POST | `/v1/jobs` | 非同步生成，回傳 202 與工作 ID（長旁白用，避免呼叫端逾時） |
 | GET | `/v1/jobs/{id}` | 工作狀態：queued／running／succeeded／failed、佇列位置、段落進度、`estimated_remaining_seconds`、結果中繼資料（含 `warnings`、`timeline`）或錯誤 |
-| DELETE | `/v1/jobs/{id}` | 取消工作：排隊中 → 200，工作變為 failed（code `cancelled`）；執行中 → 202（`cancel_requested: true`），在下一段開始前停止；重複取消 → 200；已完成 → 409 `job_finished` |
+| DELETE | `/v1/jobs/{id}` | 取消工作：排隊中 → 200，工作變為 failed（code `cancelled`）；執行中 → 202（`cancel_requested: true`），正在生成的那一段（或那一批）完成時即停止；重複取消 → 200；已完成 → 409 `job_finished` |
 | GET | `/v1/jobs/{id}/audio` | 取得完成工作的音訊 |
 
 請求本體（`/v1/audio/speech` 與 `/v1/jobs` 相同）：
@@ -174,7 +176,7 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | `voice` | | 省略時不使用已註冊的聲音；同一次呼叫內，以第一個合格片段作為後續片段的參考，維持音色一致 |
 | `response_format` | | `wav`（預設，16-bit PCM）、`flac`、`mp3` |
 | `language` | | **擴充欄位**：語言代碼或名稱（`zh`、`en`、`Chinese`…）；已知語言時建議提供 |
-| `seed` | | **擴充欄位**：整數亂數種子（0 至 2³²−1） |
+| `seed` | | **擴充欄位**：整數亂數種子（0 至 2³²−1）；只在相同 `batch_size` 下可重現 |
 
 其他欄位（如 OpenAI 的 `speed`、`instructions`）一律回 `unsupported_parameter`，不會被靜默忽略。請求本體上限 256 KiB（解析前檢查）。
 
@@ -216,6 +218,7 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 4. 輸出比估計短太多（< 0.3× 估計 − 0.5 秒，視為漏唸）或長太多（> 2.2× 估計 + 3 秒，視為模型唸完後繼續發聲）→ 重試（最多 2 次）；最終失敗回報段落索引（`segment_failed`）。介於 0.3× 與 0.7× 之間（可能漏了一句；實測漏一整句的英文段為 0.66×，129 個正常段落最低 0.75×）也重試，重試後仍偏短時保留最長的一次，不報錯，但在結果的 `warnings` 註明是哪一段，並附該段文字。實測正常語音多為估計的 0.75–2.1 倍（中文約 1.5 倍）
 5. 去除每段首尾靜音後拼接：段間 0.35 秒、段落間 0.8 秒；位於段首尾的 `[pause]` 轉為實際靜音
 6. 有 `voice` 時每段用同一參考音檔；未指定時以第一段（≥ 3 秒）的輸出作為後續段的參考，維持音色一致；在它之前的較短片段（例如標題）會用該參考重新生成一次
+7. `batch_size` > 1 時，參考音色確定後的段落以批次生成第一次嘗試（見「設定」）；結果中繼資料的 `batch_size` 是實際生成過的最大批次（沒有批次，例如只有一段或一開始就顯存不足時為 1）
 
 ## 已知限制
 
