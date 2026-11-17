@@ -300,7 +300,7 @@ def test_cancel_stops_before_the_next_generation():
     flag = {"on": False}
 
     def progress(done, total):
-        flag["on"] = True
+        flag["on"] = done >= 1  # progress(0, total) comes first, before any generation
     req = SynthesisRequest(model=adapter.entry, voice=None, text="第一段。\n\n第二段。", language="zh")
     with pytest.raises(TTSError) as e:
         synthesize(adapter, req, SegmentingConfig(), progress, cancelled=lambda: flag["on"])
@@ -437,5 +437,14 @@ def test_cancel_after_a_batch_stops_before_using_later_results():
     done = []
     req = SynthesisRequest(model=a.entry, voice=VOICE, text=PARAS, language="zh")
     with pytest.raises(TTSError) as e:
-        synthesize(a, req, SegmentingConfig(), lambda d, t: done.append(d), cancelled=lambda: bool(done))
+        synthesize(a, req, SegmentingConfig(), lambda d, t: done.append(d) if d else None,
+                   cancelled=lambda: bool(done))
     assert e.value.code == "cancelled" and done == [1] and len(a.batches) == 1
+
+
+def test_progress_reports_the_total_before_the_first_generation():
+    adapter = FakeAdapter(lambda t, i: "ok")
+    seen = []
+    req = SynthesisRequest(model=adapter.entry, voice=None, text="第一段。\n\n第二段。", language="zh")
+    synthesize(adapter, req, SegmentingConfig(), lambda d, t: seen.append((d, t, len(adapter.calls))))
+    assert seen[0] == (0, 2, 0) and seen[-1][:2] == (2, 2)

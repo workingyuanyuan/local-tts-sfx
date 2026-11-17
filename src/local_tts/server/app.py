@@ -4,22 +4,25 @@ OpenAI-compatible subset: POST /v1/audio/speech with `model`, `input`, `voice`, 
 (wav | flac | mp3). Extensions (not in OpenAI's API): `language` (code or name, e.g. "zh" /
 "Chinese") and `seed` (int, 0..2**32-1). Any other field is rejected with `unsupported_parameter`.
 POST /v1/jobs and /v1/audio/speech accept an `Idempotency-Key` header: retrying a submission with the
-same key returns the original job instead of generating again.
+same key returns the original job instead of generating again. Unknown query parameters are rejected
+like unknown body fields.
 """
 import asyncio
 import logging
 import math
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from local_tts.audio import FORMATS
+from local_tts import voices as voice_store
 from local_tts.config import load_registry, load_server_config
 from local_tts.engine import ModelManager, SynthesisRequest
 from local_tts.errors import TTSError
@@ -35,6 +38,10 @@ MAX_TOTAL_PAUSE_SECONDS = 600.0
 MAX_BODY_BYTES = 256 * 1024
 # Per-segment seeds are derived by adding small offsets, so keep the base far from torch's 64-bit limit.
 MAX_SEED = 2**32 - 1
+# GET /v1/jobs/{id}?wait=N holds the request at most this long; it returns early when the job's status
+# or progress changes. LONG_POLL_STEP is how often the waiting request looks.
+MAX_LONG_POLL = 30.0
+LONG_POLL_STEP = 0.1
 
 
 class SpeechRequest(BaseModel):
@@ -66,6 +73,15 @@ def build_app() -> FastAPI:
         yield
         scheduler.stop()
 
+    # Held while a submission resolves its voice and queues the job, and while a replaced or removed
+    # voice's recording is checked and deleted, so a job never queues a file that is being deleted.
+    voice_guard = threading.Lock()
+
+    def submit(body, key: Optional[str]) -> Job:
+        with voice_guard:
+            job, _ = scheduler.submit(to_request(body), key)
+        return job
+
     app = FastAPI(title="local-tts", lifespan=lifespan)
     app.state.scheduler = scheduler
     app.add_middleware(BodyLimit, max_bytes=MAX_BODY_BYTES)
@@ -85,6 +101,12 @@ def build_app() -> FastAPI:
             err = TTSError("invalid_request", "Invalid request body.", 400,
                            errors=[{"loc": list(x["loc"]), "msg": x["msg"]} for x in e.errors()])
         return JSONResponse({"error": err.to_dict()}, status_code=err.http_status)
+
+    def strict_query(request: Request, allowed: tuple[str, ...] = ()) -> None:
+        extra = sorted(set(request.query_params) - set(allowed))
+        if extra:
+            raise TTSError("unsupported_parameter", f"Unsupported query parameter(s): {', '.join(extra)}.", 400,
+                           parameters=extra, supported=sorted(allowed))
 
     def model_info(model_id: str) -> dict:
         entry = registry.models[model_id]
@@ -142,28 +164,70 @@ def build_app() -> FastAPI:
         return Response(audio, media_type=m["content_type"], headers=headers)
 
     @app.get("/health")
-    def health():
+    def health(request: Request):
+        strict_query(request)
+        registry.refresh_voices()
         return {
             "status": "ok", "uptime_seconds": round(time.time() - started, 1),
             "loaded_model": manager.loaded_model, "default_model": registry.default_model,
             **scheduler.stats(), "queue_max": cfg.queue_max,
             "idle_unload_seconds": cfg.idle_unload_seconds,
             "estimates": scheduler.estimates(),
+            "voice_config_error": registry.voice_error,
             "gpu": _gpu_memory(),
         }
 
     @app.get("/v1/models")
-    def list_models():
+    def list_models(request: Request):
+        strict_query(request)
         return {"object": "list", "data": [model_info(m) for m in registry.models]}
 
+    @app.post("/v1/models/unload")
+    def unload_model(request: Request):
+        # 409 model_busy while a job runs or waits; otherwise unloads now (idempotent: null if none was loaded).
+        strict_query(request)
+        return {"unloaded": scheduler.unload(), "gpu": _gpu_memory()}
+
     @app.get("/v1/voices")
-    def list_voices(model: Optional[str] = None):
+    def list_voices(request: Request, model: Optional[str] = None):
+        strict_query(request, ("model",))
         if model is not None:
             registry.resolve_model(model)
+        registry.refresh_voices()
         return {"object": "list", "data": [
-            {"name": v.name, "description": v.description, "language": v.language, "models": v.models}
+            {"name": v.name, "description": v.description, "language": v.language, "models": v.models,
+             "source": registry.voice_sources.get(v.name, "builtin")}
             for v in registry.voices.values() if model is None or model in v.models
         ]}
+
+    def clone_models(models: Optional[list[str]]) -> list[str]:
+        if not models:
+            return [m for m in registry.models if manager.adapter(m).capabilities.get("clone")]
+        for m in models:
+            registry.resolve_model(m)
+            if not manager.adapter(m).capabilities.get("clone"):
+                raise TTSError("incompatible_voice", f"Model '{m}' cannot clone voices.", 400, model=m)
+        return list(dict.fromkeys(models))
+
+    @app.put("/v1/voices/{name}")
+    async def register_voice(name: str, request: Request, description: str = "", language: Optional[str] = None,
+                             models: Optional[list[str]] = Query(None), replace: bool = False):
+        # Body: the reference recording itself (WAV/FLAC bytes, 3-30 s); metadata in the query string.
+        strict_query(request, ("description", "language", "models", "replace"))
+        targets = clone_models(models)
+        if not targets:
+            raise TTSError("incompatible_voice", "No registered model can clone voices.", 400)
+        lang = manager.adapter(targets[0]).normalize_language(language) if language else None
+        data = await request.body()
+        result = await asyncio.to_thread(voice_store.register, registry, name, data, description=description,
+                                         language=lang, models=targets, replace=replace, guard=voice_guard,
+                                         in_use=scheduler.voice_in_use)
+        return JSONResponse(result, status_code=200 if result["replaced"] else 201)
+
+    @app.delete("/v1/voices/{name}")
+    def remove_voice(name: str, request: Request):
+        strict_query(request)
+        return voice_store.remove(registry, name, guard=voice_guard, in_use=scheduler.voice_in_use)
 
     def idempotency_key(value: Optional[str]) -> Optional[str]:
         if value is not None and not (0 < len(value) <= 128 and value.isascii() and value.isprintable()):
@@ -171,33 +235,55 @@ def build_app() -> FastAPI:
         return value
 
     @app.post("/v1/audio/speech")
-    async def speech(body: SpeechRequest, idempotency_key_: Optional[str] = Header(None, alias="Idempotency-Key")):
-        job, _ = scheduler.submit(to_request(body), idempotency_key(idempotency_key_))
+    async def speech(body: SpeechRequest, request: Request,
+                     idempotency_key_: Optional[str] = Header(None, alias="Idempotency-Key")):
+        strict_query(request)
+        # Locks are taken in threads, never on the event loop (an unload holds the scheduler lock).
+        job = await asyncio.to_thread(submit, body, idempotency_key(idempotency_key_))
         if not await asyncio.to_thread(job.done.wait, cfg.sync_timeout_seconds):
             # The job keeps running; the client can poll /v1/jobs/{id} instead of resubmitting.
             raise TTSError("sync_timeout", f"Not finished within {cfg.sync_timeout_seconds:.0f}s; "
                            f"poll /v1/jobs/{job.id}.", 504, job_id=job.id)
-        return audio_response(job)
+        return await asyncio.to_thread(audio_response, job)
 
     @app.post("/v1/jobs", status_code=202)
-    def create_job(body: SpeechRequest, idempotency_key_: Optional[str] = Header(None, alias="Idempotency-Key")):
+    def create_job(body: SpeechRequest, request: Request,
+                   idempotency_key_: Optional[str] = Header(None, alias="Idempotency-Key")):
         # A repeated Idempotency-Key returns the job created by the first request (no new generation).
-        job, _ = scheduler.submit(to_request(body), idempotency_key(idempotency_key_))
-        return scheduler.snapshot(job)
+        strict_query(request)
+        return scheduler.snapshot(submit(body, idempotency_key(idempotency_key_)))
+
+    @app.get("/v1/jobs")
+    def list_jobs(request: Request):
+        strict_query(request)
+        return {"object": "list", "data": scheduler.list_jobs()}
 
     @app.get("/v1/jobs/{job_id}")
-    def get_job(job_id: str):
-        return scheduler.snapshot(scheduler.get(job_id))
+    async def get_job(job_id: str, request: Request, wait: float = Query(0.0, ge=0, le=MAX_LONG_POLL)):
+        # Long poll: with wait > 0, answer when the job finishes, its status or progress changes, or
+        # after `wait` seconds, whichever comes first. The scheduler lock is taken in a thread (an
+        # idle unload holds it for a moment), never on the event loop.
+        strict_query(request, ("wait",))
+        job = await asyncio.to_thread(scheduler.get, job_id)
+        if wait > 0:
+            end = time.monotonic() + wait
+            seen = (job.status, job.segments_done, job.segments_total)
+            while (not job.done.is_set() and (job.status, job.segments_done, job.segments_total) == seen
+                   and time.monotonic() < end):
+                await asyncio.sleep(LONG_POLL_STEP)
+        return await asyncio.to_thread(scheduler.snapshot, job)
 
     @app.delete("/v1/jobs/{job_id}")
-    def cancel_job(job_id: str):
+    def cancel_job(job_id: str, request: Request):
+        strict_query(request)
         # 200: the job is over (failed with code "cancelled"). 202: it is running and fails with code
         # "cancelled" as soon as the generation in progress (one segment or one batch) returns.
         job, stopped = scheduler.cancel(job_id)
         return JSONResponse(scheduler.snapshot(job), status_code=200 if stopped else 202)
 
     @app.get("/v1/jobs/{job_id}/audio")
-    def get_job_audio(job_id: str):
+    def get_job_audio(job_id: str, request: Request):
+        strict_query(request)
         return audio_response(scheduler.get(job_id))
 
     return app
@@ -208,26 +294,29 @@ class BodyLimit:
     checked on Content-Length and while streaming) and replayed to the app, so an oversized request
     is never read into memory or parsed."""
 
-    def __init__(self, app, max_bytes: int):
-        self.app, self.max_bytes = app, max_bytes
+    def __init__(self, app, max_bytes: int, upload_bytes: int = voice_store.MAX_UPLOAD_BYTES):
+        self.app, self.default_max, self.upload_bytes = app, max_bytes, upload_bytes
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] in ("GET", "HEAD"):
             return await self.app(scope, receive, send)
+        # A voice upload carries a recording; every other body is a small JSON request.
+        upload = scope["method"] == "PUT" and scope["path"].startswith("/v1/voices/")
+        max_bytes = self.upload_bytes if upload else self.default_max
         length = dict(scope["headers"]).get(b"content-length")
-        too_large = length is not None and (not length.isdigit() or int(length) > self.max_bytes)
+        too_large = length is not None and (not length.isdigit() or int(length) > max_bytes)
         body = bytearray()
         while not too_large:
             message = await receive()
             if message["type"] != "http.request":  # client went away
                 return
             body += message.get("body", b"")
-            too_large = len(body) > self.max_bytes
+            too_large = len(body) > max_bytes
             if not message.get("more_body"):
                 break
         if too_large:
-            err = TTSError("body_too_large", f"Request body exceeds {self.max_bytes} bytes.", 413,
-                           max_bytes=self.max_bytes)
+            err = TTSError("body_too_large", f"Request body exceeds {max_bytes} bytes.", 413,
+                           max_bytes=max_bytes)
             return await JSONResponse({"error": err.to_dict()}, status_code=413)(scope, receive, send)
         replayed = False
 

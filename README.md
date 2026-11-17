@@ -93,6 +93,10 @@ tts say -f script.txt -l zh -v demo_zh_female -o /abs/out.mp3     # 從檔案讀
 tts say "..." -o /abs/out.wav --no-wait --json                    # 只送出，exit 3 並印出 job_id
 tts job <job_id> --wait -o /abs/out.wav                           # 等待並取回
 tts cancel <job_id>                                               # 取消不再需要的工作
+tts jobs                                                          # 服務仍記得的工作（最新的在前）
+tts unload                                                        # 立即卸載模型，釋放顯存
+tts add-voice NAME /abs/ref.wav --description "..." -l zh         # 註冊聲音（--replace 取代）
+tts remove-voice NAME                                             # 移除註冊的聲音
 tts models | tts voices [-m MODEL] | tts health
 ```
 
@@ -103,6 +107,10 @@ tts models | tts voices [-m MODEL] | tts health
 - 工作送出後的錯誤附 `job_id`、`output_path` 與 `fetch_command`（接續等待用）；工作本身失敗（`job_status: "failed"`）或服務已不認得該工作（`unknown_job`，服務重啟或過期）時不附 `fetch_command`，需修正後重新送出（`tts say` 與 `tts job` 皆同）
 - `--timeline`（`say`、`job`）：結果另附每段的時間軸（見 MCP 的 `timeline`）；`fetch_command` 會保留這個選項
 - `tts cancel`：排隊中的工作立即取消（印出 `cancelled`）；執行中的工作在正在生成的那一段（或那一批）完成時停止（印出 `cancelling`）
+- `tts jobs`：列出服務仍記得的工作（完成後約保留 1 小時）：id、狀態、錯誤碼、聲音與文字開頭，用來找回遺失的 `job_id`
+- `tts unload`：沒有工作在執行或排隊時立即卸載模型；否則回 `model_busy`（附執行中的工作、佇列長度與預估閒置秒數）。下一個請求會重新載入
+- `tts add-voice` / `tts remove-voice`：見「設定」的註冊聲音
+- 等待工作時以 long poll 查詢狀態（工作完成或進度改變時立即回應），不再每秒輪詢
 - 環境變數：`LOCAL_TTS_URL`（服務位址）、`LOCAL_TTS_OUTPUT_DIR`（預設輸出目錄）
 
 ## MCP：`tts-mcp`
@@ -114,7 +122,10 @@ stdio MCP server（`.venv/bin/tts-mcp`）。工具：
 | `generate_speech` | `text`、`output_path`（絕對路徑）、`language`、`voice`、`model`、`format`、`overwrite`、`seed`、`timeline`、`wait_seconds`。完成時回傳 path、duration_seconds、sample_rate、channels、format、model、voice、segments；有段落偏短（可能漏句）時另附 `warnings`（含該段文字）；`timeline=true` 時另附 `timeline` |
 | `get_speech_job` | 等待 `pending` 的工作並寫檔；重複呼叫回傳同一結果；也接受 `timeline` |
 | `cancel_speech_job` | 取消工作：排隊中立即取消（`cancelled`），執行中在正在生成的那一段（或那一批）完成時停止並捨棄（`cancelling`）；不寫檔；已完成的工作回 `job_finished` |
-| `list_models` / `list_voices` / `tts_status` | 唯讀查詢 |
+| `list_speech_jobs` | 服務仍記得的工作（最新的在前；id、狀態、聲音、進度、文字開頭）：弄丟 `job_id` 時用來找回，不要重送同一段文字 |
+| `unload_model` | 沒有工作在執行或排隊時立即卸載模型，釋放顯存給其他 GPU 工作；否則回 `model_busy`。下一個請求會重新載入 |
+| `register_voice` | `name`、`reference_audio_path`（絕對路徑，WAV／FLAC，3–30 秒單人語音）、`description`、`language`、`models`、`replace`。由 tts-mcp 讀檔上傳；註冊後不必重啟即可用於 `voice`。說明中要求：真人的聲音要有使用者明確同意才註冊 |
+| `list_models` / `list_voices` / `tts_status` | 唯讀查詢；`list_voices` 附 `source`（`builtin` 內建、`user` 註冊） |
 
 `timeline`：每段一筆 `{index, paragraph, start, end, text}`（秒，相對於輸出檔；不含段間靜音）。段落（空行）一定從新的一段開始，所以一次長呼叫也能依段落切分影片或投影片。預設不回傳，因為它會重複整份輸入文字。`pending` 結果的 `next.arguments` 與錯誤的 `recovery` 會保留 `timeline`。
 
@@ -148,22 +159,31 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | `config/models.yaml` | 模型註冊表（`default`、adapter、HF revision、codec 精度、取樣參數、`batch_size`） |
 | `config/voices.yaml` | 聲音註冊表（名稱、描述、語言、參考音檔、相容模型） |
 
-環境變數：`LOCAL_TTS_CONFIG_DIR`（改用其他設定目錄）、`LOCAL_TTS_PORT`、`LOCAL_TTS_BATCH_SIZE`（覆寫所有模型的 `batch_size`）。
+環境變數：`LOCAL_TTS_CONFIG_DIR`（改用其他設定目錄）、`LOCAL_TTS_PORT`、`LOCAL_TTS_BATCH_SIZE`（覆寫所有模型的 `batch_size`）、`LOCAL_TTS_VOICES_DIR`（註冊聲音的目錄）。
 
 批次生成：`batch_size`（預設 1，即關閉）大於 1 時，參考音色確定後，接下來最多 `batch_size` 段的第一次生成會放進同一次批次；每段仍各自做截斷、漏唸、偏短與持續發聲的判定，需要重試或切分的段落改為逐段處理。實測 B=4 約快 2.4 倍、B=8 約快 3.5 倍，顯存多約 0.7／1.6–2.1 GiB（`docs/batch-bench-report.md`）。批次因顯存不足失敗時，該工作其餘部分改為逐段生成，不會報錯。同一個 `seed` 只在相同 `batch_size` 下產生相同音訊。顯存充足的機器可不改 repo，用 systemd drop-in 設定：`systemctl --user edit local-tts`，加入 `[Service]` 與 `Environment=LOCAL_TTS_BATCH_SIZE=4`。
 
-新增聲音：把參考音檔（幾秒鐘清楚的單人語音，wav/mp3/flac 皆可）放到 `assets/voices/`，在 `voices.yaml` 加一筆，重啟服務。
+聲音有兩個來源，修改後都不必重啟服務（下一次使用聲音時自動重新讀取）：
+
+- 內建：`config/voices.yaml`（隨 repo 發佈，參考音檔路徑相對於專案根目錄）。
+- 註冊：使用者自己的聲音放在 repo 外的 `$XDG_DATA_HOME/local-tts/voices/`（預設 `~/.local/share/local-tts/voices/`，可用 `LOCAL_TTS_VOICES_DIR` 改），內含 `voices.yaml`（格式相同，路徑相對於該目錄）與參考音檔。用 `tts add-voice`、MCP `register_voice` 或 `PUT /v1/voices/{name}` 新增：上傳的錄音（WAV／FLAC，3–30 秒、單聲道或立體聲、非靜音）轉存為 16-bit WAV，檔名含內容雜湊，取代聲音時排隊中的工作仍讀得到舊檔。名稱不可與內建聲音重複。
+
+手動改壞註冊檔時，服務繼續使用上一份有效的聲音，並在 `/health` 的 `voice_config_error` 與 `unknown_voice` 錯誤中說明原因；服務啟動時兩個檔案都必須有效。
 
 ## HTTP API
 
 | 方法 | 路徑 | 說明 |
 |---|---|---|
-| GET | `/health` | 服務狀態、已載入模型、佇列長度、執行中工作、GPU 記憶體、`estimates`（各模型實測的 RTF 與載入秒數） |
+| GET | `/health` | 服務狀態、已載入模型、佇列長度、執行中工作、GPU 記憶體、`estimates`（各模型實測的 RTF 與載入秒數）、`voice_config_error`（註冊檔無法讀取時的原因，否則 null） |
 | GET | `/v1/models` | 模型清單：id、是否預設、是否已載入、支援語言、能力、可用選項、`batch_size` |
-| GET | `/v1/voices?model=` | 聲音清單：name、描述、語言、相容模型 |
+| POST | `/v1/models/unload` | 立即卸載模型：回 `{"unloaded": 模型 id 或 null, "gpu": …}`；有工作執行或排隊時回 409 `model_busy` |
+| GET | `/v1/voices?model=` | 聲音清單：name、描述、語言、相容模型、`source`（`builtin`／`user`） |
+| PUT | `/v1/voices/{name}?description=&language=&models=&replace=` | 註冊聲音：本體是錄音檔本身（上限 16 MiB）；新增回 201、取代回 200 |
+| DELETE | `/v1/voices/{name}` | 移除註冊的聲音（內建聲音回 409 `voice_not_removable`） |
 | POST | `/v1/audio/speech` | 同步生成，直接回傳音訊 bytes（OpenAI 相容子集） |
 | POST | `/v1/jobs` | 非同步生成，回傳 202 與工作 ID（長旁白用，避免呼叫端逾時） |
-| GET | `/v1/jobs/{id}` | 工作狀態：queued／running／succeeded／failed、佇列位置、段落進度、`estimated_remaining_seconds`、結果中繼資料（含 `warnings`、`timeline`）或錯誤 |
+| GET | `/v1/jobs` | 服務仍記得的工作摘要（最新的在前）：id、狀態、模型、聲音、格式、時間、進度、字數、文字開頭（80 字）、失敗時的 `error_code` |
+| GET | `/v1/jobs/{id}?wait=` | 工作狀態：queued／running／succeeded／failed、佇列位置、段落進度（開始生成時即有 `segments_total`）、`estimated_remaining_seconds`、結果中繼資料（含 `warnings`、`timeline`）或錯誤。`wait`（0–30 秒）為 long poll：工作結束、狀態或進度改變時立即回應，否則等滿 `wait` 秒 |
 | DELETE | `/v1/jobs/{id}` | 取消工作：排隊中 → 200，工作變為 failed（code `cancelled`）；執行中 → 202（`cancel_requested: true`），正在生成的那一段（或那一批）完成時即停止；重複取消 → 200；已完成 → 409 `job_finished` |
 | GET | `/v1/jobs/{id}/audio` | 取得完成工作的音訊 |
 
@@ -178,7 +198,7 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | `language` | | **擴充欄位**：語言代碼或名稱（`zh`、`en`、`Chinese`…）；已知語言時建議提供 |
 | `seed` | | **擴充欄位**：整數亂數種子（0 至 2³²−1）；只在相同 `batch_size` 下可重現 |
 
-其他欄位（如 OpenAI 的 `speed`、`instructions`）一律回 `unsupported_parameter`，不會被靜默忽略。請求本體上限 256 KiB（解析前檢查）。
+其他欄位（如 OpenAI 的 `speed`、`instructions`）一律回 `unsupported_parameter`，不會被靜默忽略；未知的查詢參數也一樣。請求本體上限 256 KiB（解析前檢查；註冊聲音的上傳為 16 MiB）。
 
 `POST /v1/jobs` 與 `/v1/audio/speech` 接受 `Idempotency-Key` 標頭（1–128 個可列印 ASCII 字元）：用同一個鍵重送，會拿回第一次建立的工作，不會再生成一次。`tts` CLI 與 `tts-mcp` 每次送出都帶新鍵；送出後沒收到回應（連線中斷、逾時）時，會用同一個鍵重試最多 2 次。
 
@@ -195,7 +215,7 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 
 | code | HTTP | 說明 |
 |---|---|---|
-| `unknown_model` / `unknown_voice` | 404 | 附 `available` 列出可用項目 |
+| `unknown_model` / `unknown_voice` | 404 | 附 `available` 列出可用項目；註冊檔無法讀取時 `unknown_voice` 另附 `voice_config_error` |
 | `incompatible_voice` | 400 | 聲音不支援該模型 |
 | `unsupported_parameter` / `unsupported_format` / `unsupported_language` | 400 | 附可用清單 |
 | `empty_input` / `input_too_long` / `invalid_pause` / `invalid_request` | 400 | `invalid_pause`：單一 `[pause]` > 60 秒或總計 > 600 秒 |
@@ -209,6 +229,10 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 | `unknown_job` / `job_not_finished` | 404 / 409 | `job_not_finished` 附 `job_status`（queued／running） |
 | `cancelled` | 409 | 工作已被取消（工作狀態為 failed）；需要時重新送出 |
 | `job_finished` | 409 | 取消已完成的工作；附 `job_status` |
+| `model_busy` | 409 | 卸載時仍有工作執行或排隊；附 `running_job`、`queue_length`、`estimated_idle_seconds` |
+| `voice_exists` / `voice_not_removable` | 409 | 註冊的名稱已存在（取代要帶 `replace`；內建聲音不可取代）／內建聲音不可移除 |
+| `invalid_voice_name` / `invalid_audio` | 400 | 名稱限英數字與 `_-.`（最多 64 字）／錄音無法解碼、不是 3–30 秒、超過 2 聲道或為靜音 |
+| `voice_config_error` | 500 | 註冊檔無法讀取，修正或移除後再註冊 |
 
 ## 長文處理
 

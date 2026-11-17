@@ -143,6 +143,44 @@ class Scheduler:
             raise TTSError("job_finished", f"Job '{job_id}' already {job.status}; nothing to cancel.", 409,
                            job_status=job.status)
 
+    def unload(self) -> Optional[str]:
+        """Unload the model now (returns its id, or None if none was loaded). Only when idle: the
+        worker uses the adapter outside the manager's lock, so unloading under a running job would pull
+        the model out from under it. Holding the scheduler lock keeps a new job from starting meanwhile."""
+        with self.cond:
+            if self.running is not None or self.pending:
+                last = self.pending[-1] if self.pending else self.running
+                raise TTSError("model_busy", "A job is running or queued; the model stays loaded until the "
+                               "service is idle (wait for the jobs, or cancel them first).", 409,
+                               running_job=self.running.id if self.running else None,
+                               queue_length=len(self.pending), estimated_idle_seconds=self._estimate(last))
+            model = self.manager.unload()
+        if model:
+            log.info("unloaded %s on request", model)
+        return model
+
+    def voice_in_use(self, path) -> bool:
+        """Does a queued or running job still need this reference audio file?"""
+        with self.cond:
+            jobs = list(self.pending) + ([self.running] if self.running else [])
+            return any(j.request.voice is not None and j.request.voice.reference_audio == path for j in jobs)
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        """Short summaries of every job the service still knows, newest first (to find a lost job id)."""
+        with self.cond:
+            out = []
+            for job in sorted(self.jobs.values(), key=lambda j: j.created, reverse=True):
+                text = job.request.text
+                d = {"id": job.id, "status": job.status, "model": job.request.model.id,
+                     "voice": job.request.voice.name if job.request.voice else None,
+                     "format": job.request.response_format, "created": job.created, "finished": job.finished,
+                     "chars": len(text), "text": text if len(text) <= 80 else text[:79] + "…",
+                     "progress": {"segments_done": job.segments_done, "segments_total": job.segments_total}}
+                if job.error is not None:
+                    d["error_code"] = job.error.get("code")
+                out.append(d)
+            return out
+
     def _model_loaded(self, model_id: str) -> bool:
         return self.manager.loaded_model == model_id
 

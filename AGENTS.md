@@ -31,12 +31,13 @@ Agent ──MCP stdio──▶ tts-mcp ─┐
 **排程**
 - 只有一個服務程序、一個 GPU worker。請求進有界佇列；佇列滿時回 `queue_full`，未取走的音訊超過 `max_result_bytes` 時回 `results_full`，不無限堆積。
 - 模型的載入與卸載受互斥鎖保護，同一模型不會重複載入。切換模型前先卸載目前的模型。
-- 閒置卸載只在沒有執行中工作、且佇列為空時觸發。
+- 閒置卸載與手動卸載（`/v1/models/unload`）都只在沒有執行中工作、且佇列為空時進行，並持有排程器的鎖（worker 在模型管理器的鎖之外使用 adapter）。
 
 **模型與聲音**
 - 未指定 `model` 時用 `models.yaml` 的 `default`。
 - 未指定 `voice` 時不使用任何已註冊的聲音。為了讓同一次呼叫的音色一致，以第一個至少 3 秒的合格片段作為後續片段的參考；在它之前較短的片段，會用這個參考重新生成。
 - 指定 `voice` 時，每一段都用同一個參考音檔。
+- 使用者註冊的聲音放在 repo 外（`config.user_voices_dir()`），不寫入 `config/voices.yaml`；兩個聲音檔修改後自動重新讀取，讀取失敗時保留上一份有效的聲音並回報。服務不開啟呼叫端的檔案，註冊時由 tts-mcp／CLI 讀檔上傳。
 - 未知的模型或聲音要回錯，並列出可用項目。
 - 不支援的參數一律明確報錯，絕不靜默忽略（HTTP 與 MCP 都一樣）。
 - HTTP 的 OpenAI 相容範圍只有 `/v1/audio/speech` 的 `model`、`input`、`voice`、`response_format`（wav、flac、mp3）；其他擴充欄位要寫進文件。

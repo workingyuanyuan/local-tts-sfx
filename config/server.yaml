@@ -1,7 +1,8 @@
 host: 127.0.0.1
 port: 8765
 # Max requests waiting in the queue (not counting the one running). Full queue → 503 queue_full.
-queue_max: 8
+# Waiting jobs hold only their text (finished audio is bounded by max_result_bytes).
+queue_max: 32
 # Unload the model after this many idle seconds (only when nothing is running and the queue is empty).
 idle_unload_seconds: 600
 # Finished jobs (and their audio) are kept this long for /v1/jobs/{id} polling.

@@ -4,6 +4,10 @@
   tts say -f script.txt -o /abs/out.mp3        (-f - reads stdin)
   tts job <job_id> [--wait] [-o /abs/out.wav]  (status of / fetch a job, e.g. after --no-wait)
   tts cancel <job_id>                          (stop a job that is no longer needed)
+  tts jobs                                     (jobs the service still knows, newest first)
+  tts unload                                   (free GPU memory now; refused while jobs run or wait)
+  tts add-voice NAME /abs/ref.wav [--description D] [--language L] [--model ID] [--replace]
+  tts remove-voice NAME                        (registered voices only)
   tts models | tts voices [--model ID] | tts health
   --timeline (say / job): also report each segment's start/end seconds and text
 
@@ -159,6 +163,34 @@ async def cmd_cancel(c: TTSClient, a) -> int:
     return 0
 
 
+async def cmd_jobs(c: TTSClient, a) -> int:
+    js = await c.jobs()
+    _print(js, a.json, "\n".join(
+        f"{j['id']}  {j['status']:<9} {j.get('error_code') or '':<10} {j['voice'] or '-':<16} {j['text']}"
+        for j in js) or "(no jobs)")
+    return 0
+
+
+async def cmd_unload(c: TTSClient, a) -> int:
+    r = await c.unload()
+    _print(r, a.json, f"unloaded {r['unloaded']}" if r["unloaded"] else "no model was loaded")
+    return 0
+
+
+async def cmd_add_voice(c: TTSClient, a) -> int:
+    r = await c.register_voice(a.name, a.reference, description=a.description, language=a.language,
+                               models=a.model, replace=a.replace)
+    _print(r, a.json, f"{'replaced' if r['replaced'] else 'registered'} voice {r['name']} "
+                      f"({r['seconds']}s, models: {', '.join(r['models'])})")
+    return 0
+
+
+async def cmd_remove_voice(c: TTSClient, a) -> int:
+    r = await c.remove_voice(a.name)
+    _print(r, a.json, f"removed voice {r['name']}")
+    return 0
+
+
 async def cmd_models(c: TTSClient, a) -> int:
     ms = await c.models()
     _print(ms, a.json, "\n".join(
@@ -223,6 +255,22 @@ def main(argv=None) -> int:
     k = sub.add_parser("cancel", parents=[common], help="cancel a queued or running job")
     k.add_argument("job_id")
     k.set_defaults(func=cmd_cancel)
+
+    sub.add_parser("jobs", parents=[common], help="list the jobs the service still knows").set_defaults(func=cmd_jobs)
+    sub.add_parser("unload", parents=[common], help="unload the model now (only when idle)").set_defaults(
+        func=cmd_unload)
+    av = sub.add_parser("add-voice", parents=[common], help="register a voice from a 3-30 s recording of one speaker")
+    av.add_argument("name", help="letters, digits, '_', '-', '.'")
+    av.add_argument("reference", help="absolute path of the reference recording (WAV or FLAC)")
+    av.add_argument("--description", default="")
+    av.add_argument("-l", "--language", help="the recording's language, e.g. zh, en")
+    av.add_argument("-m", "--model", action="append", help="model the voice is for (repeatable; default: all "
+                    "models that can clone)")
+    av.add_argument("--replace", action="store_true", help="replace a registered voice with this name")
+    av.set_defaults(func=cmd_add_voice)
+    rv = sub.add_parser("remove-voice", parents=[common], help="remove a registered voice")
+    rv.add_argument("name")
+    rv.set_defaults(func=cmd_remove_voice)
 
     sub.add_parser("models", parents=[common], help="list models").set_defaults(func=cmd_models)
     v = sub.add_parser("voices", parents=[common], help="list voices")

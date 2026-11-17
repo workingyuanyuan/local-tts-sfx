@@ -216,6 +216,8 @@ class _Synthesis:
         top-level segment being re-split (None at the top level, where each segment is its own).
         Returns one-element slots (concatenated by run()), so an early piece can be replaced later."""
         out: list[list[np.ndarray]] = []
+        if seg_index is None and self.progress:  # the total is known before the first (slow) generation
+            self.progress(0, len(segments))
         for i, seg in enumerate(segments):
             index = i if seg_index is None else seg_index
             s = None if seed is None else seed + (1000 if seg_index is None else 100) * (i + 1)

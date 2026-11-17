@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -40,6 +41,11 @@ DOWNLOAD_TIMEOUT = 30.0
 MIN_REQUEST_SECONDS = 0.5
 # A submission whose response was lost is retried (same Idempotency-Key) this many times in all.
 SUBMIT_ATTEMPTS = 3
+# The server may hold one status request this long (long poll; its limit is 30 s): it answers as soon
+# as the job finishes or its progress changes, so waiting needs no fixed polling interval.
+LONG_POLL = 20.0
+# Largest reference recording register_voice uploads (the server's limit).
+MAX_VOICE_UPLOAD = 16 * 2**20
 
 EXISTS_HINT = "set overwrite (MCP: overwrite=true, CLI: --overwrite) to replace it"
 
@@ -91,6 +97,30 @@ class Deadline:
         return max(0.01, min(cap, self.end + MIN_REQUEST_SECONDS - time.monotonic()))
 
 
+def _from_windows(path: str) -> str:
+    """A Windows path (C:\\..., \\\\wsl$\\...) as a Linux path, via wslpath (WSL only)."""
+    try:
+        proc = subprocess.run(["wslpath", "-u", path], capture_output=True, text=True)
+    except FileNotFoundError:  # not WSL: there is no Windows filesystem to map to
+        raise ClientError("invalid_path", f"Windows path '{path}' is only supported under WSL "
+                          "(wslpath not found); give a Linux absolute path.") from None
+    if proc.returncode != 0:
+        raise ClientError("invalid_path", f"Cannot convert Windows path '{path}': {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def resolve_input_path(path: str) -> Path:
+    """An existing local file named by an absolute (or Windows) path."""
+    if WINDOWS_PATH_RE.match(path):
+        path = _from_windows(path)
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise ClientError("invalid_path", f"The path must be absolute, got '{path}'.")
+    if not p.is_file():
+        raise ClientError("invalid_path", f"'{p}' is not an existing file.", path=str(p))
+    return p
+
+
 def resolve_output_path(path: Optional[str], fmt: Optional[str]) -> tuple[Path, str]:
     """Return (absolute path, format). Raises ClientError for unusable paths."""
     if fmt is not None and fmt not in FORMATS:
@@ -102,14 +132,7 @@ def resolve_output_path(path: Optional[str], fmt: Optional[str]) -> tuple[Path, 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         return OUTPUT_DIR / f"{stamp}.{fmt}", fmt
     if WINDOWS_PATH_RE.match(path):
-        try:
-            proc = subprocess.run(["wslpath", "-u", path], capture_output=True, text=True)
-        except FileNotFoundError:  # not WSL: there is no Windows filesystem to map to
-            raise ClientError("invalid_path", f"Windows path '{path}' is only supported under WSL "
-                              "(wslpath not found); give a Linux absolute path.") from None
-        if proc.returncode != 0:
-            raise ClientError("invalid_path", f"Cannot convert Windows path '{path}': {proc.stderr.strip()}")
-        path = proc.stdout.strip()
+        path = _from_windows(path)
     p = Path(path).expanduser()
     if not p.is_absolute():
         raise ClientError("invalid_path", f"output_path must be absolute, got '{path}'.")
@@ -244,35 +267,74 @@ class TTSClient:
                     raise
             await asyncio.sleep(0.5)
 
+    async def jobs(self) -> list[dict]:
+        """Summaries of the jobs the service still knows, newest first."""
+        return (await self._request("GET", "/v1/jobs")).json()["data"]
+
+    async def unload(self) -> dict:
+        """Unload the model now ({"unloaded": id or None, "gpu": ...}); model_busy while jobs run or wait."""
+        return (await self._request("POST", "/v1/models/unload", timeout=60.0)).json()
+
+    async def register_voice(self, name: str, reference: str, *, description: str = "", language=None,
+                             models: Optional[list[str]] = None, replace: bool = False) -> dict:
+        """Upload a reference recording (read here: the service never opens the caller's files)."""
+        path = resolve_input_path(reference)
+        if path.stat().st_size > MAX_VOICE_UPLOAD:
+            raise ClientError("invalid_audio", f"'{path}' is larger than {MAX_VOICE_UPLOAD} bytes; give a 3-30 s "
+                              "recording.", path=str(path))
+        params: list[tuple[str, str]] = [("description", description)]
+        if language:
+            params.append(("language", language))
+        params += [("models", m) for m in models or []]
+        if replace:
+            params.append(("replace", "true"))
+        r = await self._request("PUT", f"/v1/voices/{quote(name, safe='')}", timeout=DOWNLOAD_TIMEOUT,
+                                params=params, content=path.read_bytes(),
+                                headers={"Content-Type": "application/octet-stream"})
+        return r.json()
+
+    async def remove_voice(self, name: str) -> dict:
+        return (await self._request("DELETE", f"/v1/voices/{quote(name, safe='')}")).json()
+
     async def cancel(self, job_id: str) -> dict:
         """Cancel a job; returns its snapshot (status "failed" once stopped, else still "running")."""
         return (await self._request("DELETE", f"/v1/jobs/{job_id}")).json()
 
-    async def job(self, job_id: str, timeout: float = POLL_TIMEOUT) -> dict:
-        return (await self._request("GET", f"/v1/jobs/{job_id}", timeout=timeout)).json()
+    async def job(self, job_id: str, timeout: float = POLL_TIMEOUT, wait: float = 0.0) -> dict:
+        """A job's snapshot; with `wait`, the server answers when the job finishes or its progress
+        changes, or after `wait` seconds (long poll)."""
+        params = {"wait": f"{wait:.2f}"} if wait > 0 else None
+        return (await self._request("GET", f"/v1/jobs/{job_id}", timeout=timeout, params=params)).json()
 
     async def wait(self, job_id: str, deadline: Deadline, poll: float = 1.0, last: Optional[dict] = None,
                    on_progress: Optional[Callable[[dict], None]] = None) -> dict:
-        """Poll until the job finishes or the deadline passes; return the latest snapshot.
-        A poll cut off by the deadline returns `last` (the job is still pending); other failures raise."""
+        """Wait (long polls) until the job finishes or the deadline passes; return the latest snapshot.
+        A request cut off by the deadline returns `last` (the job is still pending); other failures raise."""
         while True:
             # A finished job, or no time left: report what we know instead of asking again.
             if last is not None and (last["status"] in ("succeeded", "failed") or deadline.expired()):
                 return last
+            r = deadline.remaining()
+            # The server's answer must arrive before the deadline's grace runs out.
+            hold = LONG_POLL if r is None else max(0.0, min(LONG_POLL, r - MIN_REQUEST_SECONDS / 2))
+            sent = time.monotonic()
             try:
-                j = await self.job(job_id, timeout=deadline.request_timeout(POLL_TIMEOUT))
+                j = await self.job(job_id, timeout=deadline.request_timeout(hold + POLL_TIMEOUT), wait=hold)
             except ClientError as e:
                 if e.code == "server_timeout" and last is not None and deadline.remaining() is not None \
                         and deadline.remaining() < 1.0:
                     return last
                 raise
-            last = j
+            prev, last = last, j
             if on_progress:
                 on_progress(j)
             if j["status"] in ("succeeded", "failed") or deadline.expired():
                 return j
-            r = deadline.remaining()
-            await asyncio.sleep(poll if r is None else min(poll, r))
+            # A server without long polling answers at once: then poll at the old pace, never spin.
+            unchanged = prev is not None and (prev["status"], prev.get("progress")) == (j["status"], j.get("progress"))
+            if unchanged and time.monotonic() - sent < min(hold, poll) / 2:
+                r = deadline.remaining()
+                await asyncio.sleep(poll if r is None else min(poll, r))
 
     async def save(self, job: dict, path: Path, overwrite: bool) -> dict:
         """Download a succeeded job's audio to `path`; return the result metadata (the per-segment

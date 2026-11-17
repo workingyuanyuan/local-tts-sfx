@@ -352,6 +352,52 @@ async def cancel_speech_job(job_id: str) -> dict[str, Any]:
 
 
 @server.tool(annotations=READS)
+async def list_speech_jobs() -> list[dict[str, Any]]:
+    """Jobs the service still knows (about an hour after they finish), newest first: id, status, voice,
+    created/finished times, progress and the start of the text. Use it to find a job_id you lost (e.g.
+    after a context reset) instead of submitting the same text again; then call get_speech_job."""
+    return await _run(client.jobs)
+
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                         open_world_hint=False))
+async def unload_model() -> dict[str, Any]:
+    """Unload the TTS model from the GPU now, to free its memory for other GPU work (Blender, another
+    model). Call it only when all narration for the task is done: the next speech request loads the
+    model again (tens of seconds). Refused with model_busy while a job runs or waits. Without it the
+    model unloads by itself after the service has been idle for a while (tts_status: idle_unload_seconds)."""
+    return await _run(client.unload)
+
+
+@server.tool(annotations=WRITES)
+async def register_voice(
+    name: str,
+    reference_audio_path: str,
+    description: str = "",
+    language: Optional[str] = None,
+    models: Optional[list[str]] = None,
+    replace: bool = False,
+) -> dict[str, Any]:
+    """Register a voice from a recording so generate_speech(voice=name) can clone it (no restart needed).
+    Only register a real person's voice (the user's own recording, a colleague's) when the user has
+    explicitly asked for or approved it. To keep one narrator across many files, a 3-30 s clip of
+    clean speech you generated earlier (one speaker, no music) also works.
+
+    Args:
+        name: New voice name: letters, digits, '_', '-', '.' (max 64).
+        reference_audio_path: Absolute path of the recording (WAV or FLAC, 3-30 s, one speaker).
+        description: What the voice sounds like (shown by list_voices).
+        language: The recording's language, e.g. "zh", "en".
+        models: Model ids the voice is for. Default: every model that can clone.
+        replace: Replace a voice you registered earlier with this name (shipped voices cannot be replaced).
+    """
+    async def call() -> dict[str, Any]:
+        return await client.register_voice(name, reference_audio_path, description=description, language=language,
+                                           models=models, replace=replace)
+    return await _run(call)
+
+
+@server.tool(annotations=READS)
 async def list_models() -> list[dict[str, Any]]:
     """List TTS models: id, whether it is the default, whether it is loaded, supported languages,
     capabilities (clone, pause_marker, pinyin, ...) and accepted options."""
@@ -362,7 +408,8 @@ async def list_models() -> list[dict[str, Any]]:
 
 @server.tool(annotations=READS)
 async def list_voices(model: Optional[str] = None) -> list[dict[str, Any]]:
-    """List voices that can be cloned: name, description, language, compatible models.
+    """List voices that can be cloned: name, description, language, compatible models and source
+    ("builtin", shipped with local-tts, or "user", added with register_voice).
     Pass model to only list voices compatible with it."""
     return await _run(client.voices, model)
 

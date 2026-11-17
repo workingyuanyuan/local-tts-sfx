@@ -41,9 +41,9 @@ Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_
      (later segments reuse the first ≥ 3 s of output as reference), but separate calls sound like
      different speakers. Whenever several clips or batches must sound like the same narrator, pass the
      same `voice` to every call: call `list_voices` and pick one matching the language.
-   - The user's own reference recording must first be registered as a voice (file in
-     `{{LOCAL_TTS_ROOT}}/assets/voices/`, entry in `{{LOCAL_TTS_ROOT}}/config/voices.yaml`, then
-     `systemctl --user restart local-tts`). Ask before doing that.
+   - To clone a recording, register it with `register_voice` (absolute path, 3-30 s of one speaker;
+     usable at once). A real person's voice, including the user's own, only with the user's explicit
+     approval: ask first.
 3. **Write into the task's project directory** with an absolute `output_path`, following the project's
    existing layout (e.g. `assets/audio/`, else `audio/`). Use descriptive names (`scene01.wav`).
    Format: `.wav` for editing and video pipelines, `.mp3` for sharing, `.flac` for lossless and smaller.
@@ -66,8 +66,9 @@ Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_
    - interrupted (connection, timeout, write error): `get_speech_job` with the arguments it gives;
    - `job_status: "failed"`, or `unknown_job`: the job is over; fix the cause if there is one and make
      a new `generate_speech` call.
-   Synthesis runs at about 0.6× real time (a 5-minute narration takes about 3 minutes) plus up to
-   ~20 s to load the model when idle.
+   Pending results carry `estimated_remaining_seconds` (measured on this machine; loading the model
+   when idle adds up to ~20 s). Lost a job_id (e.g. after a context reset)? `list_speech_jobs` finds
+   it; do not resubmit the text.
 6. **Hand the result to the next step.** Use the returned `duration_seconds` for timing, then verify
    the final product with `ffprobe`. Typical ffmpeg steps:
    - join clips: `ffmpeg -f concat -safe 0 -i list.txt -c copy narration.wav` (same format clips)
@@ -90,5 +91,6 @@ Errors are JSON `{"error": {"code", "message", ...}}`.
 - `segment_failed` / `segment_truncated` name the failing segment: rephrase or shorten that passage
   and submit again. `unknown_job` (the service restarted or the job expired): submit it again.
 - `gpu_out_of_memory`: not enough GPU memory. Check `tts_status`, `nvidia-smi` and the logs, then tell
-  the user what you found.
+  the user what you found. When all narration is done and the next step needs the GPU (Blender,
+  another model), `unload_model` frees the TTS model's memory at once.
 - Logs: `journalctl --user -u local-tts`.
