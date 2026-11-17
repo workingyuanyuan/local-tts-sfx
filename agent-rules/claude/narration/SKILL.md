@@ -29,7 +29,8 @@ If MCP is unavailable, use the CLI with a bounded wait:
 Several clips: `tts clips deck.json -d /abs/dir -l zh --json --timeout 45` (deck.json:
 `[{"id": "s01", "text": "..."}]`). Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the
 JSON has `job_id` and a `fetch_command`; run that command with `--timeout 45` added, repeating while
-it exits 3. 4 = clips finished but some failed or were not written (see each clip). Never rerun
+it exits 3. 4 = clips finished but some failed or were not written: follow the JSON's `recovery` (a
+`fetch_command` is given only when fetching again can help). Never rerun
 `tts say` / `tts clips` for a job that exists.
 
 ## Workflow

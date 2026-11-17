@@ -62,12 +62,12 @@ def _show_result(r: dict, a) -> None:
             print(f"[tts] warning: {w}", file=sys.stderr)
 
 
-def _fetch_command(a, job_id: str, path, clips: bool = False) -> str:
+def _fetch_command(a, job_id: str, path, clips: bool = False, overwrite: bool = False) -> str:
     """A copy-pasteable command that resumes waiting for a job (keeps --url / --overwrite)."""
     cmd = ["tts", "job", job_id, "--wait", "-d" if clips else "-o", str(path)]
     if a.url != DEFAULT_URL:
         cmd += ["--url", a.url]
-    if a.overwrite:
+    if a.overwrite or overwrite:
         cmd.append("--overwrite")
     if a.timeline:
         cmd.append("--timeline")
@@ -123,6 +123,26 @@ async def cmd_say(c: TTSClient, a) -> int:
     return 0
 
 
+def _clips_recovery(r: dict, a, job_id: str, directory) -> dict:
+    """A partial result says what to do about each kind of failed clip: fetching again only helps clips
+    that were synthesized but not written; a clip that failed in synthesis needs a new tts clips run."""
+    if r["status"] == "completed":
+        return r
+    notes = []
+    synth = [c["id"] for c in r["clips"] if c.get("stage") == "synthesis"]
+    deliver = [c for c in r["clips"] if c.get("stage") == "delivery"]
+    if synth:
+        notes.append(f"Clips {', '.join(synth)} failed in synthesis (see each error); fetching cannot help: fix the "
+                     "cause if there is one and run tts clips again with only those clips (same --voice).")
+    if deliver:
+        exists = any(c["error"].get("code") == "output_exists" for c in deliver)
+        r = r | {"fetch_command": _fetch_command(a, job_id, directory, clips=True, overwrite=exists)}
+        notes.append(f"Clips {', '.join(c['id'] for c in deliver)} were not written (see each error): run "
+                     "fetch_command" + (" (--overwrite replaces the existing files)." if exists and not a.overwrite
+                                        else "."))
+    return r | {"recovery": " ".join(notes)}
+
+
 def _show_clips(r: dict, a) -> int:
     r = with_timeline(r, a.timeline)
     lines = [f"{r['status']}: {r['output_dir']}  (model={r['model']}, voice={r['voice'] or 'default'})"]
@@ -133,6 +153,10 @@ def _show_clips(r: dict, a) -> int:
                 lines.append(f"      {t['start']:8.3f}-{t['end']:8.3f}  [p{t['paragraph']} s{t['index']}] {t['text']}")
         else:
             lines.append(f"  {clip['id']}: FAILED ({clip['stage']}) {clip['error']['code']}: {clip['error']['message']}")
+    if r.get("recovery"):
+        lines.append(f"recovery: {r['recovery']}")
+    if r.get("fetch_command"):
+        lines.append(f"  {r['fetch_command']}")
     _print(r, a.json, "\n".join(lines))
     if not a.json:
         for w in r.get("warnings", []) + [w for clip in r["clips"] for w in clip.get("warnings", [])]:
@@ -181,9 +205,7 @@ async def cmd_clips(c: TTSClient, a) -> int:
             err.details["recovery"] = ("The job failed or the service no longer has it; fetching cannot help. Fix the "
                                        "cause if there is one and run tts clips again (only the clips still needed).")
         raise err from None
-    if r["status"] != "completed":
-        r["fetch_command"] = fetch  # writes the clips that are still missing
-    return _show_clips(r, a)
+    return _show_clips(_clips_recovery(r, a, job["id"], directory), a)
 
 
 async def cmd_job(c: TTSClient, a) -> int:
@@ -204,9 +226,7 @@ async def cmd_job(c: TTSClient, a) -> int:
         raise_job_error(job)
         if job["status"] == "succeeded" and a.dir:
             r = await c.save_clips(job, directory, a.overwrite)
-            if r["status"] != "completed":
-                r["fetch_command"] = _fetch_command(a, a.job_id, directory, clips=True)
-            return _show_clips(r, a)
+            return _show_clips(_clips_recovery(r, a, a.job_id, directory), a)
         if job["status"] == "succeeded" and a.output:
             path, _ = resolve_output_path(a.output, job["result"]["format"])
             target = str(path)

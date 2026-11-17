@@ -105,7 +105,7 @@ tts models | tts voices [-m MODEL] | tts health
 - `-o` 必須是絕對路徑；在 WSL 中，Windows 路徑（`C:\...`）會用 `wslpath` 轉換（非 WSL 環境回 `invalid_path`）；副檔名決定格式（.wav／.flac／.mp3）
 - 目標已存在時報錯，加 `--overwrite` 才覆寫；未指定 `-o` 時寫到 `~/.local/share/local-tts/output/<timestamp>.wav`
 - `--json` 輸出機器可讀結果；錯誤一律以 JSON 印到 stderr；結果有 `warnings`（可能漏句）時，文字模式會印到 stderr
-- exit code：0 完成、1 錯誤、2 用法錯誤、3 仍在處理（`--no-wait` 或 `--timeout` 到期，工作會繼續執行）、4 多片段工作已結束但有片段失敗或未寫入（結果說明是哪些，附 `fetch_command`）
+- exit code：0 完成、1 錯誤、2 用法錯誤、3 仍在處理（`--no-wait` 或 `--timeout` 到期，工作會繼續執行）、4 多片段工作已結束但有片段失敗或未寫入（結果說明是哪些，並附 `recovery`：合成失敗的片段要另用 `tts clips` 只送那些片段；未寫入的片段才附 `fetch_command`，目標已存在時會帶 `--overwrite`）
 - `tts clips FILE`：FILE（`-` 為 stdin）是 JSON 陣列 `[{"id": "s01", "text": "..."}]`，見「多片段工作」；`-d` 為輸出目錄（絕對路徑；省略時在預設輸出目錄下建立新資料夾）
 - 工作送出後的錯誤附 `job_id`、`output_path`（多片段為 `output_dir`）與 `fetch_command`（接續等待用）；工作本身失敗（`job_status: "failed"`）或服務已不認得該工作（`unknown_job`，服務重啟或過期）時改附 `recovery`，需修正後重新送出（`tts say`、`tts clips` 與 `tts job` 皆同）
 - `--timeline`（`say`、`job`）：結果另附每段的時間軸（見 MCP 的 `timeline`）；`fetch_command` 會保留這個選項

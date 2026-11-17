@@ -162,9 +162,18 @@ def test_cli_clips(tts, tmp_path, capsys):
     spec.write_text(json.dumps([{"id": "ok", "text": "好。"}, {"id": "bad", "text": BAD}]), encoding="utf-8")
     assert cli.main(["--json", "clips", str(spec), "-d", str(out)]) == 4
     res = json.loads(capsys.readouterr().out)
-    assert res["status"] == "partial" and res["fetch_command"].startswith("tts job ")
+    # Only a synthesis failure: fetching again cannot help, so no fetch_command (found on the GPU).
+    assert res["status"] == "partial" and "fetch_command" not in res and "tts clips again" in res["recovery"]
     assert cli.main(["--json", "job", res["job_id"], "--wait", "-d", str(out)]) == 4
     assert json.loads(capsys.readouterr().out)["clips"][0]["status"] == "completed"
+    (out / "ok.wav").write_bytes(b"changed")  # a clip that cannot be written: fetch, with --overwrite
+    assert cli.main(["--json", "job", res["job_id"], "--wait", "-d", str(out)]) == 4
+    res = json.loads(capsys.readouterr().out)
+    assert res["clips"][0]["error"]["code"] == "output_exists" and res["fetch_command"].endswith("--overwrite")
+    assert "tts clips again" in res["recovery"] and "fetch_command" in res["recovery"]
+    assert cli.main(["job", res["job_id"], "--wait", "-d", str(out), "--overwrite"]) == 4
+    text = capsys.readouterr().out
+    assert "recovery:" in text and "tts job" not in text and (out / "ok.wav").read_bytes() != b"changed"
 
     spec.write_text("not json", encoding="utf-8")
     assert cli.main(["clips", str(spec), "-d", str(out)]) == 1
