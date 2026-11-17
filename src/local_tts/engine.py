@@ -4,12 +4,12 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, ClassVar, Optional
 
 import numpy as np
 
 from local_tts.adapters import adapter_class
-from local_tts.adapters.base import Adapter, SegmentAudio
+from local_tts.adapters.base import Adapter, ModelAdapter, SegmentAudio, SoundEffectAdapter
 from local_tts.audio import silence, trim_silence
 from local_tts.config import ModelEntry, Registry, SegmentingConfig, VoiceEntry
 from local_tts.errors import TTSError
@@ -33,42 +33,66 @@ MIN_REFERENCE_SECONDS = 3.0
 
 
 class ModelManager:
-    """Holds at most one loaded model; load/unload are serialized by a lock."""
+    """Holds at most one loaded model (speech or sound effects); load/unload are serialized by a lock.
+    A model that cannot be unloaded stays current, so no other model loads beside it."""
 
     def __init__(self, registry: Registry):
         self.registry = registry
-        self.adapters: dict[str, Adapter] = {
+        self.adapters: dict[str, ModelAdapter] = {
             m.id: adapter_class(m.adapter)(m) for m in registry.models.values()
         }
         for a in self.adapters.values():
+            kind = getattr(a.entry, "kind", "tts")
+            if (kind == "sfx") != isinstance(a, SoundEffectAdapter):
+                raise ValueError(f"model '{a.entry.id}': kind '{kind}' does not match adapter '{a.entry.adapter}'")
             size = int(a.entry.options.get("batch_size", 1))
             if size > 1 and not a.supports_batch:
                 raise ValueError(f"model '{a.entry.id}': batch_size is {size}, but adapter '{a.entry.adapter}' "
                                  "cannot generate in batches; set batch_size: 1")
-        self.current: Optional[Adapter] = None
+        self.current: Optional[ModelAdapter] = None
         self.lock = threading.Lock()
         # Wall-clock seconds of the most recent acquire() that actually loaded a model (else None).
         self.last_load_seconds: Optional[float] = None
 
-    def adapter(self, model_id: str) -> Adapter:
+    def adapter(self, model_id: str) -> ModelAdapter:
         return self.adapters[model_id]
 
-    def acquire(self, model_id: str) -> Adapter:
+    def _release_current(self, reason: str) -> None:
+        """Unload the current model (caller holds the lock). If that fails it stays current, and the error
+        says no other model will load until it is released."""
+        cur = self.current
+        model_id = cur.entry.id
+        log.info("unloading %s%s", model_id, reason)
+        error = None
+        try:
+            cur.unload()
+        except Exception as e:  # noqa: BLE001 - reported as model_unload_failed
+            log.exception("unloading %s failed", model_id)
+            error = TTSError("model_unload_failed", f"Could not unload model '{model_id}': {type(e).__name__}: {e}. "
+                             "No other model is loaded until it is released (the next job or "
+                             "POST /v1/models/unload tries again).", 500, model=model_id)
+        if error is not None:
+            raise error
+        self.current = None
+
+    def acquire(self, model_id: str) -> ModelAdapter:
         with self.lock:
             target = self.adapters[model_id]
             self.last_load_seconds = None
             if self.current is target and target.loaded:
                 return target
             if self.current is not None:
-                # One GPU is not guaranteed to hold two models: unload before switching.
-                log.info("unloading %s before loading %s", self.current.entry.id, model_id)
-                self.current.unload()
-                self.current = None
+                # One GPU is not guaranteed to hold two models: unload before switching (or clean up
+                # a model whose worker died before loading it again).
+                self._release_current(f" before loading {model_id}")
             t = time.perf_counter()
             log.info("loading %s", model_id)
             error = None
             try:
                 target.load()
+            except TTSError as e:  # an adapter's own diagnosis (e.g. what to install) keeps its code
+                log.warning("loading %s failed: %s %s", model_id, e.code, e.message)
+                error = TTSError(e.code, f"Failed to load model '{model_id}': {e.message}", e.http_status, **e.details)
             except Exception as e:  # noqa: BLE001 - any load failure is reported as model_load_failed
                 log.exception("loading %s failed", model_id)
                 error = TTSError("model_load_failed", f"Failed to load model '{model_id}': "
@@ -76,7 +100,12 @@ class ModelManager:
             if error is not None:
                 # Raised outside the except block so no traceback (and no partially loaded GPU
                 # tensor referenced from its frames) stays attached to the error.
-                target.unload()
+                self.current = target
+                try:
+                    self._release_current(" after a failed load")
+                except TTSError as e:
+                    error.message += f" {e.message}"  # target stays current: nothing else loads beside it
+                    error.details["unload_error"] = e.message
                 raise error
             self.last_load_seconds = time.perf_counter() - t
             log.info("loaded %s in %.1fs", model_id, self.last_load_seconds)
@@ -88,8 +117,7 @@ class ModelManager:
             if self.current is None:
                 return None
             model_id = self.current.entry.id
-            self.current.unload()
-            self.current = None
+            self._release_current("")
             log.info("unloaded %s", model_id)
             return model_id
 
@@ -107,6 +135,7 @@ class ModelManager:
 
 @dataclass
 class SynthesisRequest:
+    kind: ClassVar[str] = "tts"
     model: ModelEntry
     voice: Optional[VoiceEntry]
     text: str

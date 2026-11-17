@@ -8,6 +8,12 @@ OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 and OpenMOSS-Team/MOSS-Audio-Token
 Hugging Face at runtime. MOSS-TTS is licensed under the Apache License, Version 2.0
 (third_party/MOSS-TTS/LICENSE). Copyright OpenMOSS Team, Fudan University, SII and MOSI.
 
+Sound effects use MOSS-SoundEffect v2.0: the moss_soundeffect_v2 package from the same MOSS-TTS
+submodule (third_party/MOSS-TTS/moss_soundeffect_v2, Apache License, Version 2.0), installed into the
+separate worker environment workers/moss-sfx, and the OpenMOSS-Team/MOSS-SoundEffect-v2.0 weights
+(revision e35df4d82fbe87fcd5d14e5d100e349c0c3c076d), loaded from Hugging Face at runtime; the model card
+states the Apache License, Version 2.0.
+
 Demo voice reference audio taken from the MOSS-TTS repository (Apache-2.0):
 - assets/voices/demo_zh_female.wav and assets/ref/reference_zh.wav: unchanged copies of
   assets/audio/reference_zh.wav

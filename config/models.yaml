@@ -1,5 +1,7 @@
-# Model registry. `default` is used when a request does not name a model.
+# Model registry. `default` is used when a speech request does not name a model, `default_sfx` when a
+# sound-effect request (POST /v1/sfx/jobs) does not. `kind` is tts (speech, the default) or sfx.
 default: moss-tts-local-v1.5
+default_sfx: moss-sfx-v2.0
 
 models:
   moss-tts-local-v1.5:
@@ -25,3 +27,31 @@ models:
     # a batch that runs out of memory falls back to one segment at a time. The same seed reproduces
     # the same audio only with the same batch_size. Override per machine with LOCAL_TTS_BATCH_SIZE.
     batch_size: 1
+
+  moss-sfx-v2.0:
+    kind: sfx
+    adapter: moss_sfx
+    description: MOSS-SoundEffect v2.0（文字生成音效，48 kHz 單聲道，每段最長 30 秒）
+    repo: OpenMOSS-Team/MOSS-SoundEffect-v2.0
+    revision: e35df4d82fbe87fcd5d14e5d100e349c0c3c076d
+    # The model runs in its own environment (its pins conflict with the service's): a persistent worker
+    # subprocess started with <worker>/.venv/bin/python <worker>/worker.py. Path relative to the project root.
+    # Install: uv sync --frozen --project workers/moss-sfx
+    worker: workers/moss-sfx
+    # Longest clip the model generates (it always denoises a 30 s latent and crops it).
+    max_seconds: 30
+    sample_rate: 48000
+    # Official sampling parameters (num_inference_steps and cfg_scale can be set per request).
+    sampling:
+      num_inference_steps: 100
+      cfg_scale: 4.0
+      sigma_shift: 5.0
+    # torch.compile of the DiT: ~14 s per clip compiled vs. >= 36 s uncompiled, for a slower first load
+    # (compiled kernels are cached under the user cache dir). Needs a C compiler; without one the worker
+    # runs uncompiled and says so in /health and in each job's warnings. Override per machine with
+    # LOCAL_TTS_SFX_COMPILE=0/1.
+    compile: true
+    # A worker that does not report ready (load + compile warm-up) or answer one clip within these
+    # many seconds is treated as hung: it is killed and the job fails.
+    load_timeout_seconds: 1800
+    generate_timeout_seconds: 600

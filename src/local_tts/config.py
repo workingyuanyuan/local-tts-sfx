@@ -42,6 +42,14 @@ class SegmentingConfig:
 
 
 @dataclass
+class SfxLimits:
+    """Per-request limits of POST /v1/sfx/jobs (see config/server.yaml)."""
+    max_prompt_chars: int = 2000
+    max_clips: int = 100
+    max_total_seconds: float = 300.0
+
+
+@dataclass
 class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8765
@@ -53,6 +61,11 @@ class ServerConfig:
     # /v1/audio/speech waits at most this long, then returns 504 sync_timeout with the job id.
     sync_timeout_seconds: float = 1800
     segmenting: SegmentingConfig = field(default_factory=SegmentingConfig)
+    sfx: SfxLimits = field(default_factory=SfxLimits)
+
+
+MODEL_KINDS = ("tts", "sfx")  # speech models and sound-effect models
+KIND_NAMES = {"tts": "speech", "sfx": "sound-effect"}
 
 
 @dataclass
@@ -61,6 +74,7 @@ class ModelEntry:
     adapter: str
     description: str
     options: dict[str, Any]
+    kind: str = "tts"
 
 
 @dataclass
@@ -82,6 +96,8 @@ class Registry:
     voice_sources: dict[str, str] = field(default_factory=dict)
     # Set when a changed voices file could not be loaded (the previous voices stay in use).
     voice_error: Optional[str] = None
+    # Used when a sound-effect request names no model (None: no sound-effect model is configured).
+    default_sfx: Optional[str] = None
     _stamp: Any = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -106,13 +122,28 @@ class Registry:
                 log.info("voice registry reloaded: %s", ", ".join(sorted(voices)) or "(none)")
             self.voices, self.voice_sources, self.voice_error, self._stamp = voices, sources, None, stamp
 
-    def resolve_model(self, model_id: Optional[str]) -> ModelEntry:
+    def models_of(self, kind: str) -> list[str]:
+        return sorted(m for m, e in self.models.items() if e.kind == kind)
+
+    def resolve_model(self, model_id: Optional[str], kind: Optional[str] = None) -> ModelEntry:
+        """The named model, or the default of `kind` ("tts" unless given). With `kind`, a model of the
+        other kind is an error listing the models of the right kind."""
         if model_id is None:
+            if kind == "sfx":
+                if self.default_sfx is None:
+                    raise TTSError("no_sfx_model", "No sound-effect model is configured (default_sfx in "
+                                   "config/models.yaml).", 400, available=self.models_of("sfx"))
+                return self.models[self.default_sfx]
             return self.models[self.default_model]
         if model_id not in self.models:
             raise TTSError("unknown_model", f"Unknown model '{model_id}'.", 404,
-                           available=sorted(self.models))
-        return self.models[model_id]
+                           available=sorted(self.models) if kind is None else self.models_of(kind))
+        entry = self.models[model_id]
+        if kind is not None and entry.kind != kind:
+            have, want = (KIND_NAMES[k] for k in (entry.kind, kind))
+            raise TTSError("wrong_model_kind", f"Model '{model_id}' is a {have} model; this request needs a "
+                           f"{want} model.", 400, model_kind=entry.kind, available=self.models_of(kind))
+        return entry
 
     def resolve_voice(self, name: Optional[str], model_id: str) -> Optional[VoiceEntry]:
         if name is None:
@@ -140,7 +171,11 @@ def _read_yaml(name: str) -> dict:
 def load_server_config() -> ServerConfig:
     raw = _read_yaml("server.yaml")
     seg = SegmentingConfig(**raw.pop("segmenting", {}))
-    cfg = ServerConfig(**raw, segmenting=seg)
+    sfx = SfxLimits(**raw.pop("sfx", {}))
+    for name, value in vars(sfx).items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+            raise ValueError(f"server.yaml sfx.{name} must be a positive number, got {value!r}")
+    cfg = ServerConfig(**raw, segmenting=seg, sfx=sfx)
     if "LOCAL_TTS_PORT" in os.environ:
         cfg.port = int(os.environ["LOCAL_TTS_PORT"])
     return cfg
@@ -156,22 +191,52 @@ def _batch_size(model_id: str, value: Any, source: str) -> int:
     return size
 
 
+_BOOLS = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
+
+
+def _compile_flag(model_id: str, value: Any, source: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in _BOOLS:
+        return _BOOLS[value.strip().lower()]
+    raise ValueError(f"model '{model_id}': compile from {source} must be true or false (1/0), got {value!r}")
+
+
 def load_registry() -> Registry:
     raw_models = _read_yaml("models.yaml")
     models = {}
     # A machine with spare GPU memory can batch without editing the tracked models.yaml.
     override = os.environ.get("LOCAL_TTS_BATCH_SIZE")
+    # A machine without a working compiler toolchain (or wanting faster cold starts) can turn
+    # torch.compile off for sound-effect models the same way.
+    compile_override = os.environ.get("LOCAL_TTS_SFX_COMPILE")
     for model_id, m in raw_models.get("models", {}).items():
         m = dict(m)
-        m["batch_size"] = (_batch_size(model_id, override, "LOCAL_TTS_BATCH_SIZE") if override is not None
-                           else _batch_size(model_id, m.get("batch_size", 1), "models.yaml"))
+        kind = m.pop("kind", "tts")
+        if kind not in MODEL_KINDS:
+            raise ValueError(f"model '{model_id}': kind must be one of {', '.join(MODEL_KINDS)}, got {kind!r}")
+        if kind == "tts":
+            m["batch_size"] = (_batch_size(model_id, override, "LOCAL_TTS_BATCH_SIZE") if override is not None
+                               else _batch_size(model_id, m.get("batch_size", 1), "models.yaml"))
+        else:
+            if "batch_size" in m:
+                raise ValueError(f"model '{model_id}': batch_size applies to speech models only")
+            m["compile"] = (_compile_flag(model_id, compile_override, "LOCAL_TTS_SFX_COMPILE")
+                            if compile_override is not None
+                            else _compile_flag(model_id, m.get("compile", False), "models.yaml"))
+            max_seconds = m.get("max_seconds")
+            if isinstance(max_seconds, bool) or not isinstance(max_seconds, (int, float)) or not max_seconds > 0:
+                raise ValueError(f"model '{model_id}': max_seconds must be a positive number, got {max_seconds!r}")
         models[model_id] = ModelEntry(id=model_id, adapter=m.pop("adapter"),
-                                      description=m.pop("description", ""), options=m)
+                                      description=m.pop("description", ""), options=m, kind=kind)
     default = raw_models.get("default")
-    if default not in models:
-        raise ValueError(f"models.yaml default '{default}' is not a registered model")
+    if default not in models or models[default].kind != "tts":
+        raise ValueError(f"models.yaml default '{default}' is not a registered speech model")
+    default_sfx = raw_models.get("default_sfx")
+    if default_sfx is not None and (default_sfx not in models or models[default_sfx].kind != "sfx"):
+        raise ValueError(f"models.yaml default_sfx '{default_sfx}' is not a registered sound-effect model")
 
-    registry = Registry(default_model=default, models=models, voices={})
+    registry = Registry(default_model=default, models=models, voices={}, default_sfx=default_sfx)
     # At startup a broken voices file is fatal (as before); later changes are reloaded leniently.
     registry.voices, registry.voice_sources = load_voices(models)
     registry._stamp = _voice_stamp()
@@ -225,8 +290,8 @@ def _voice_entry(name: str, v: Any, base: Path, models: dict[str, ModelEntry], p
         ref = base / ref
     if not ref.exists():
         raise ValueError(f"voice '{name}': reference_audio not found: {ref}")
-    unknown = set(v.get("models", [])) - set(models)
+    unknown = set(v.get("models", [])) - {m for m, e in models.items() if e.kind == "tts"}
     if unknown:
-        raise ValueError(f"voice '{name}': unknown models {sorted(unknown)}")
+        raise ValueError(f"voice '{name}': unknown (or not speech) models {sorted(unknown)}")
     return VoiceEntry(name=name, description=v.get("description", ""), language=v.get("language"),
                       reference_audio=ref, models=list(v.get("models", [])), transcript=v.get("transcript"))

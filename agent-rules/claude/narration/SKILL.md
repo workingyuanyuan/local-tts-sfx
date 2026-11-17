@@ -23,6 +23,7 @@ MCP server `local-tts` (load them with ToolSearch if they are deferred):
 - `mcp__local-tts__register_voice` — make a recording usable as `voice` (see step 2).
 - `mcp__local-tts__unload_model` — free the GPU memory once all narration is done.
 - `mcp__local-tts__list_voices`, `mcp__local-tts__list_models`, `mcp__local-tts__tts_status`.
+- Non-speech sound (effects, foley, ambience) comes from the same service: see the `sound-effects` skill.
 
 If MCP is unavailable, use the CLI with a bounded wait:
 `tts say -f script.txt -l zh -o /abs/path/narration.wav --json --timeout 45`.

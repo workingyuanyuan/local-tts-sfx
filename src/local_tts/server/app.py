@@ -6,11 +6,18 @@ OpenAI-compatible subset: POST /v1/audio/speech with `model`, `input`, `voice`, 
 POST /v1/jobs and /v1/audio/speech accept an `Idempotency-Key` header: retrying a submission with the
 same key returns the original job instead of generating again. Unknown query parameters are rejected
 like unknown body fields.
+
+Sound effects (models of kind "sfx"): POST /v1/sfx/jobs only (asynchronous, 202), with either `prompt`
+and `seconds` (one effect) or `clips` [{id, prompt, seconds?, seed?}] (a clip without `seconds` uses the
+top-level one), plus optional `model` (default: models.yaml default_sfx), `seed`, `response_format`,
+`num_inference_steps` and `cfg_scale`. The job endpoints (/v1/jobs, /v1/jobs/{id}, its audio and
+DELETE) serve both kinds; an Idempotency-Key is matched only against submissions of the same kind.
 """
 import asyncio
 import logging
 import math
 import re
+import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +34,7 @@ from local_tts import voices as voice_store
 from local_tts.config import load_registry, load_server_config
 from local_tts.engine import ModelManager, SynthesisRequest
 from local_tts.errors import TTSError
+from local_tts.sfx import EffectClip, SoundEffectRequest
 from local_tts.text import pause_values
 from local_tts.server.scheduler import Job, Scheduler
 
@@ -78,6 +86,36 @@ class JobRequest(SpeechRequest):
     clips: Optional[list[ClipInput]] = None
 
 
+# Sound-effect request bounds beyond the configured limits (server.yaml `sfx:`) and the model's own
+# duration range.
+MAX_SFX_STEPS = 500
+MIN_CFG_SCALE, MAX_CFG_SCALE = 1.0, 20.0
+SFX_OPTION_FIELDS = ("seed", "num_inference_steps", "cfg_scale")
+
+
+class SfxClipInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    prompt: str
+    seconds: Optional[float] = Field(default=None, strict=True)
+    seed: Optional[int] = Field(default=None, ge=0, le=MAX_SEED)
+
+
+class SfxJobRequest(BaseModel):
+    """POST /v1/sfx/jobs: `prompt` + `seconds` (one effect), or `clips` (one audio per clip)."""
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: Optional[str] = None
+    seconds: Optional[float] = Field(default=None, strict=True)
+    clips: Optional[list[SfxClipInput]] = None
+    model: Optional[str] = None
+    seed: Optional[int] = Field(default=None, ge=0, le=MAX_SEED)
+    response_format: str = "wav"
+    num_inference_steps: Optional[int] = Field(default=None, strict=True, ge=1, le=MAX_SFX_STEPS)
+    cfg_scale: Optional[float] = Field(default=None, strict=True)
+
+
 def build_app() -> FastAPI:
     cfg = load_server_config()
     registry = load_registry()
@@ -117,7 +155,10 @@ def build_app() -> FastAPI:
             # ("body", "clips", <index>, <field>) is a field inside a clip; ("body", "clips") the clips field itself
             in_clip = any(err["type"] == "extra_forbidden" and len(err["loc"]) > 3 and err["loc"][1] == "clips"
                           for err in e.errors())
-            model = ClipInput if in_clip else JobRequest if request.url.path == "/v1/jobs" else SpeechRequest
+            if request.url.path == "/v1/sfx/jobs":
+                model = SfxClipInput if in_clip else SfxJobRequest
+            else:
+                model = ClipInput if in_clip else JobRequest if request.url.path == "/v1/jobs" else SpeechRequest
             err = TTSError("unsupported_parameter", f"Unsupported parameter(s): {', '.join(extra)}.", 400,
                            parameters=extra, supported=sorted(model.model_fields))
         else:
@@ -134,17 +175,23 @@ def build_app() -> FastAPI:
     def model_info(model_id: str) -> dict:
         entry = registry.models[model_id]
         adapter = manager.adapter(model_id)
-        return {
-            "id": model_id, "object": "model", "owned_by": "local",
-            "description": entry.description, "default": model_id == registry.default_model,
+        info = {
+            "id": model_id, "object": "model", "owned_by": "local", "kind": entry.kind,
+            "description": entry.description,
+            # the default of its kind (speech: `default`, sound effects: `default_sfx`)
+            "default": model_id == (registry.default_sfx if entry.kind == "sfx" else registry.default_model),
             "loaded": manager.loaded_model == model_id,
             "languages": sorted(adapter.languages), "capabilities": adapter.capabilities,
             "options": sorted(adapter.supported_options),
-            "batch_size": int(entry.options.get("batch_size", 1)),
         }
+        if entry.kind == "sfx":
+            info["sfx"] = adapter.status()
+        else:
+            info["batch_size"] = int(entry.options.get("batch_size", 1))
+        return info
 
     def to_request(body: SpeechRequest) -> SynthesisRequest:
-        entry = registry.resolve_model(body.model)
+        entry = registry.resolve_model(body.model, kind="tts")
         voice = registry.resolve_voice(body.voice, entry.id)
         adapter = manager.adapter(entry.id)
         given = [f for f in EXTENSION_FIELDS if getattr(body, f) is not None]
@@ -191,22 +238,105 @@ def build_app() -> FastAPI:
                                 language=language, seed=body.seed,
                                 clips=None if clips is None else [(c.id, c.input) for c in clips])
 
+    def to_sfx_request(body: SfxJobRequest) -> SoundEffectRequest:
+        entry = registry.resolve_model(body.model, kind="sfx")
+        adapter = manager.adapter(entry.id)
+        lim = cfg.sfx
+        given = [f for f in SFX_OPTION_FIELDS
+                 if getattr(body, f) is not None or (f == "seed" and any(c.seed is not None for c in body.clips or []))]
+        unsupported = [f for f in given if f not in adapter.supported_options]
+        if unsupported:
+            raise TTSError("unsupported_parameter",
+                           f"Model '{entry.id}' does not support: {', '.join(unsupported)}.", 400,
+                           parameters=unsupported, supported=sorted(adapter.supported_options))
+        if body.response_format not in FORMATS:
+            raise TTSError("unsupported_format", f"Unsupported response_format '{body.response_format}'.", 400,
+                           available=sorted(FORMATS))
+        if body.cfg_scale is not None and not (math.isfinite(body.cfg_scale)
+                                               and MIN_CFG_SCALE <= body.cfg_scale <= MAX_CFG_SCALE):
+            raise TTSError("invalid_request", f"cfg_scale must be between {MIN_CFG_SCALE:g} and {MAX_CFG_SCALE:g}.",
+                           400, min_cfg_scale=MIN_CFG_SCALE, max_cfg_scale=MAX_CFG_SCALE)
+        if (body.prompt is None) == (body.clips is None):
+            raise TTSError("invalid_request", "Give either prompt (one effect) or clips.", 400)
+        if body.clips is not None:
+            if not 1 <= len(body.clips) <= lim.max_clips:
+                raise TTSError("invalid_request", f"clips must hold 1-{lim.max_clips} clips.", 400,
+                               max_clips=lim.max_clips)
+            ids = [c.id for c in body.clips]
+            bad = [i for i in ids if not CLIP_ID_RE.fullmatch(i)]
+            if bad:
+                raise TTSError("invalid_clip_id", "Clip ids are 1-64 characters: letters, digits, '_', '-' or '.', "
+                               "starting with a letter or digit (they name the output files).", 400, ids=bad)
+            dup = sorted({i for i in ids if ids.count(i) > 1})
+            if dup:
+                raise TTSError("invalid_clip_id", f"Duplicate clip id(s): {', '.join(dup)}.", 400, ids=dup)
+            # A clip's seed is its own; otherwise the job seed + the clip's index; otherwise a random one.
+            specs = [(c.id, c.prompt, c.seconds if c.seconds is not None else body.seconds,
+                      c.seed if c.seed is not None else None if body.seed is None else body.seed + i)
+                     for i, c in enumerate(body.clips)]
+        else:
+            specs = [("effect", body.prompt, body.seconds, body.seed)]
+        where = (lambda cid: "" if body.clips is None else f" (clip '{cid}')")
+        empty = [cid for cid, prompt, _, _ in specs if not prompt.strip()]
+        if empty:
+            raise TTSError("empty_input", "Empty prompt" + ("." if body.clips is None else f"s: {', '.join(empty)}."),
+                           400, **({} if body.clips is None else {"clips": empty}))
+        long = [cid for cid, prompt, _, _ in specs if len(prompt) > lim.max_prompt_chars]
+        if long:
+            raise TTSError("input_too_long", f"Prompt{where(long[0])} exceeds {lim.max_prompt_chars} characters.",
+                           400, max_chars=lim.max_prompt_chars, **({} if body.clips is None else {"clips": long}))
+        for cid, _, seconds, _ in specs:
+            if seconds is None:
+                raise TTSError("invalid_seconds", f"seconds is required{where(cid)}: how long the effect should be "
+                               f"({adapter.min_seconds:g}-{adapter.max_seconds:g}).", 400,
+                               min_seconds=adapter.min_seconds, max_seconds=adapter.max_seconds)
+            if not (math.isfinite(seconds) and adapter.min_seconds <= seconds <= adapter.max_seconds):
+                raise TTSError("invalid_seconds", f"seconds{where(cid)} must be between {adapter.min_seconds:g} and "
+                               f"{adapter.max_seconds:g} for model '{entry.id}', got {seconds!r}.", 400,
+                               min_seconds=adapter.min_seconds, max_seconds=adapter.max_seconds)
+        total = sum(seconds for _, _, seconds, _ in specs)
+        if total > lim.max_total_seconds:
+            raise TTSError("too_many_seconds", f"The clips ask for {total:g} s together; at most "
+                           f"{lim.max_total_seconds:g} s per job.", 400, max_total_seconds=lim.max_total_seconds)
+        if not adapter.installed():  # fail now rather than when the job reaches the model
+            raise adapter.install_error()
+        return SoundEffectRequest(
+            model=entry, single=body.clips is None, response_format=body.response_format,
+            num_inference_steps=body.num_inference_steps, cfg_scale=body.cfg_scale,
+            clips=[EffectClip(cid, prompt, float(seconds), secrets.randbelow(MAX_SEED + 1) if seed is None else seed)
+                   for cid, prompt, seconds, seed in specs])
+
+    def job_clip_ids(job: Job) -> Optional[list[str]]:
+        req = job.request
+        if req.kind == "sfx":
+            return req.clip_ids
+        return None if req.clips is None else [c for c, _ in req.clips]
+
     def audio_response(job: Job, clip: Optional[str] = None) -> Response:
-        is_clips = job.request.clips is not None
+        ids = job_clip_ids(job)
+        is_clips = ids is not None
         if is_clips and clip is None:
             raise TTSError("clip_required", f"Job '{job.id}' is a clips job: fetch each clip with ?clip=<id>.", 400,
-                           clips=[c for c, _ in job.request.clips])
+                           clips=ids)
         if not is_clips and clip is not None:
             raise TTSError("invalid_request", f"Job '{job.id}' has one audio; omit clip.", 400)
-        if is_clips and clip not in {c for c, _ in job.request.clips}:
-            raise TTSError("unknown_clip", f"Job '{job.id}' has no clip '{clip}'.", 404,
-                           clips=[c for c, _ in job.request.clips])
+        if is_clips and clip not in set(ids):
+            raise TTSError("unknown_clip", f"Job '{job.id}' has no clip '{clip}'.", 404, clips=ids)
         status, error, http_status, audio, m = scheduler.outcome(job, clip)
         if error is not None:
             details = {k: v for k, v in error.items() if k not in ("code", "message")}
             raise TTSError(error["code"], error["message"], http_status, job_id=job.id, **details)
         if status != "succeeded":
             raise TTSError("job_not_finished", f"Job '{job.id}' is {status}.", 409, job_status=status)
+        if job.request.kind == "sfx":
+            info = m if clip is None else next(c for c in m["clips"] if c["id"] == clip)
+            if info.get("status", "succeeded") != "succeeded":
+                raise TTSError("clip_failed", f"Clip '{clip}' failed: {info['error']['message']}", 409,
+                               job_id=job.id, clip=clip, clip_error=info["error"])
+            headers = {"X-TTS-Job-Id": job.id, "X-TTS-Kind": "sfx", "X-TTS-Model": quote(m["model"]),
+                       "X-TTS-Duration": str(info["duration"]), "X-TTS-Sample-Rate": str(m["sample_rate"]),
+                       "X-TTS-Channels": str(m["channels"]), "X-TTS-Seed": str(info["seed"])}
+            return Response(audio, media_type=m["content_type"], headers=headers)
         segments, duration = m["segments"], m["duration"]
         if clip is not None:
             info = next(c for c in m["clips"] if c["id"] == clip)
@@ -230,10 +360,14 @@ def build_app() -> FastAPI:
         return {
             "status": "ok", "uptime_seconds": round(time.time() - started, 1),
             "loaded_model": manager.loaded_model, "default_model": registry.default_model,
+            "default_sfx_model": registry.default_sfx,
             **scheduler.stats(), "queue_max": cfg.queue_max,
             "idle_unload_seconds": cfg.idle_unload_seconds,
             "estimates": scheduler.estimates(),
             "voice_config_error": registry.voice_error,
+            # Sound-effect models: worker environment installed, weights cached, compile state, worker pid.
+            "sfx": {m: {"loaded": manager.loaded_model == m, **manager.adapter(m).status()}
+                    for m in registry.models_of("sfx")},
             "gpu": _gpu_memory(),
         }
 
@@ -312,6 +446,15 @@ def build_app() -> FastAPI:
         # A repeated Idempotency-Key returns the job created by the first request (no new generation).
         strict_query(request)
         return scheduler.snapshot(submit(body, idempotency_key(idempotency_key_)))
+
+    @app.post("/v1/sfx/jobs", status_code=202)
+    def create_sfx_job(body: SfxJobRequest, request: Request,
+                       idempotency_key_: Optional[str] = Header(None, alias="Idempotency-Key")):
+        # Sound effects are asynchronous only: poll /v1/jobs/{id}, then fetch /v1/jobs/{id}/audio[?clip=].
+        strict_query(request)
+        key = idempotency_key(idempotency_key_)
+        job, _ = scheduler.submit(to_sfx_request(body), key)
+        return scheduler.snapshot(job)
 
     @app.get("/v1/jobs")
     def list_jobs(request: Request):

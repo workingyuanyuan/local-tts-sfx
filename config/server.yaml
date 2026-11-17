@@ -27,3 +27,13 @@ segmenting:
   max_retries: 2
   # Truncated segments are split and retried at most this many levels deep.
   max_split_depth: 2
+
+# POST /v1/sfx/jobs (sound effects). Each clip is generated separately (about the same time per clip
+# whatever its length), so the limits count prompts and seconds rather than characters.
+sfx:
+  # Characters per prompt (a clip's or the single effect's).
+  max_prompt_chars: 2000
+  # Clips per job.
+  max_clips: 100
+  # Requested seconds of all clips of one job together.
+  max_total_seconds: 300

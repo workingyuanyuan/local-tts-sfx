@@ -1,6 +1,6 @@
 # local-tts
 
-讓 Claude Code、Codex 等 coding agent 用本機 GPU 自己生成旁白語音的 TTS 服務。第一版模型：[MOSS-TTS-Local-Transformer-v1.5](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5)。
+讓 Claude Code、Codex 等 coding agent 用本機 GPU 自己生成旁白語音與音效的服務。語音模型：[MOSS-TTS-Local-Transformer-v1.5](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5)；音效模型：[MOSS-SoundEffect v2.0](https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect-v2.0)（見「音效」）。
 
 ## 這是什麼？
 
@@ -17,12 +17,16 @@
   - 截斷或疑似漏句時自動重試。
   - 長時間的工作用工作 ID 接續，不會因 Agent 逾時而重複生成。
 - **輸出交給後續流程**：直接寫成 wav、flac 或 mp3 檔，放在任務的專案目錄裡，可以接著用 ffmpeg 合成影片。
+- **音效**：影片、動畫、遊戲原型或 UI 展示需要非語音的聲音（音效、擬音、環境音、轉場、UI 音）時，Agent 用同一個服務以文字生成，每段最長 30 秒。
 
 ```
 Agent ──MCP stdio──▶ tts-mcp ─┐
       ──shell──────▶ tts CLI ─┤  HTTP
                               ▼
                     tts-server（常駐服務，單一 GPU worker＋有界佇列）
+                      ├─ 語音模型：同一程序內的 adapter
+                      └─ 音效模型：獨立環境的 worker 子程序（workers/moss-sfx）
+                         兩者同一時間只會載入一個
 ```
 
 修改本 repo 時的規則見 [AGENTS.md](AGENTS.md)。開發過程的實測紀錄：[第 1 步](docs/step1-report.md)、[第 2 步](docs/step2-report.md)、[第 3 步](docs/step3-report.md)、[第 4 步](docs/step4-report.md)、[發布前稽核](docs/final-audit.md)。
@@ -36,6 +40,7 @@ Agent ──MCP stdio──▶ tts-mcp ─┐
 | 驅動 | 支援 CUDA 12.8 的 NVIDIA 驅動（Linux 570 以上）；PyTorch 自帶 CUDA runtime，不需另裝 CUDA Toolkit |
 | 磁碟 | 權重約 16.5 GiB（放在 `~/.cache/huggingface/`；實測模型 8.5 GiB、codec 8.0 GiB），`.venv` 約 7.3 GiB |
 | 工具 | `git`、`ffmpeg`（Ubuntu：`sudo apt-get install ffmpeg`）、[uv](https://docs.astral.sh/uv/) |
+| 音效（選用） | 另需權重約 11 GiB 與 worker 環境 `workers/moss-sfx/.venv` 約 7.5 GiB（本機量測）。C 編譯器（`cc`、`gcc` 或 `clang`，或 `$CC`）為選用：有它時以 torch.compile 加速；沒有時自動改為不編譯執行（較慢），並在 `/health`、`/v1/models` 與每個工作結果的 `warnings` 註明，不會報錯 |
 
 只在 RTX 5090 Laptop（24 GB，WSL2 Ubuntu）上完整實測過。其他 GPU 若符合上述需求應可執行，但效能與顯存用量可能不同。
 
@@ -55,6 +60,16 @@ codex mcp add local-tts -- "$PWD/.venv/bin/tts-mcp"            # 註冊給 Codex
 scripts/install_agent_rules.sh              # 安裝 Agent 使用規則（見「Agent 使用規則」）
 .venv/bin/tts health                        # 確認服務正常
 ```
+
+音效（選用）：音效模型的套件版本和服務衝突（它固定 numpy 1.26.4、transformers 4.57.1），所以有自己的環境，由 `workers/moss-sfx/uv.lock` 鎖定：
+
+```bash
+UV_HTTP_TIMEOUT=600 uv sync --frozen --project workers/moss-sfx      # 建立 workers/moss-sfx/.venv
+uvx --from huggingface_hub hf download OpenMOSS-Team/MOSS-SoundEffect-v2.0 --revision e35df4d82fbe87fcd5d14e5d100e349c0c3c076d
+systemctl --user restart local-tts                                   # 之後 tts health 的 sfx 區段應顯示 worker_installed: true
+```
+
+沒裝 worker 環境時，音效請求回 503 `sfx_worker_not_installed`（附 `install_command`），語音功能不受影響；缺權重時回 503 `model_weights_missing`（附 `download_command`）。
 
 已 clone 但沒有 submodule 時，補跑 `git submodule update --init third_party/MOSS-TTS`（不需要 MOSS-TTS 自己的 submodule）。只想用其中一種 Agent 時，略過另一個的註冊即可。
 
@@ -79,6 +94,7 @@ systemctl --user status local-tts
 - 日誌：`journalctl --user -u local-tts -f`
 - 健康檢查：`curl -s localhost:8765/health`（埠可用 `config/server.yaml` 或環境變數 `LOCAL_TTS_PORT` 修改；client 端用 `LOCAL_TTS_URL`）
 - 模型延遲載入：第一個請求才載入，約 10–20 秒；閒置 10 分鐘後自動卸載。
+- 語音模型與音效模型不會同時載入：請求另一種模型時，先卸載目前的模型（音效模型是結束並回收 worker 子程序）再載入，每次切換要數十秒，所以同一個任務的語音與音效應分批生成，不要交錯。
 - 沒有 systemd 或要除錯時，改為前景執行：`HF_HUB_OFFLINE=1 .venv/bin/tts-server`
 - user service 預設只在使用者登入期間執行；要開機常駐，執行 `sudo loginctl enable-linger $USER`。WSL 中，服務只在 WSL 執行期間運作。
 - 每個工作結束、佇列為空時，把 PyTorch 快取但未使用的顯存還給系統（模型權重仍常駐），方便同機的其他 GPU 工作使用。
@@ -100,6 +116,8 @@ tts unload                                                        # 立即卸載
 tts add-voice NAME /abs/ref.wav --description "..." -l zh         # 註冊聲音（--replace 取代）
 tts remove-voice NAME                                             # 移除註冊的聲音
 tts models | tts voices [-m MODEL] | tts health
+tts sfx "a heavy wooden door slams shut" -s 3 -o /abs/door.wav    # 音效（-s/--seconds 必填，最多 30）
+tts sfx-clips effects.json -d /abs/sfx [-s 4]                      # 多段音效：每段一個檔（<id>.wav）
 ```
 
 - `-o` 必須是絕對路徑；在 WSL 中，Windows 路徑（`C:\...`）會用 `wslpath` 轉換（非 WSL 環境回 `invalid_path`）；副檔名決定格式（.wav／.flac／.mp3）
@@ -114,6 +132,7 @@ tts models | tts voices [-m MODEL] | tts health
 - `tts unload`：沒有工作在執行或排隊時立即卸載模型；否則回 `model_busy`（附執行中的工作、佇列長度與預估閒置秒數）。下一個請求會重新載入
 - `tts add-voice` / `tts remove-voice`：見「設定」的註冊聲音
 - 等待工作時以 long poll 查詢狀態（工作完成或進度改變時立即回應），不再每秒輪詢
+- `tts sfx PROMPT -s N`：一段音效。`tts sfx-clips FILE`：FILE（`-` 為 stdin）是 JSON 陣列 `[{"id": "door", "prompt": "...", "seconds": 3, "seed": 1}]`（`seconds`、`seed` 可省略；沒有 `seconds` 的片段用 `-s`，沒有 `seed` 的片段用 `--seed` 加上片段序號，都沒有時由服務隨機產生並在結果中回報）。兩者都接受 `-m/--model`、`--seed`、`--format`、`--steps`、`--cfg-scale`、`--overwrite`、`--no-wait`、`--timeout`、`--json`，exit code、`fetch_command` 與錯誤處理同 `tts say`／`tts clips`；取回同樣用 `tts job <id> --wait -o FILE`（或 `-d DIR`）。`tts jobs`、`tts cancel`、`tts models`、`tts unload`、`tts health` 也涵蓋音效工作與模型
 - 環境變數：`LOCAL_TTS_URL`（服務位址）、`LOCAL_TTS_OUTPUT_DIR`（預設輸出目錄）
 
 ## MCP：`tts-mcp`
@@ -126,11 +145,17 @@ stdio MCP server（`.venv/bin/tts-mcp`）。工具：
 | `get_speech_job` | 等待 `pending` 的工作並寫檔；重複呼叫回傳同一結果；也接受 `timeline` |
 | `generate_speech_clips` | `clips`（`[{id, text}]`，依順序，最多 100 個）、`output_dir`（絕對路徑）與 `generate_speech` 相同的其他參數（套用到所有片段）。每個片段寫成 `<output_dir>/<id>.<format>`，見「多片段工作」。回傳 `completed`（全部寫入）或 `partial`（附 `recovery`），每個片段各有 path、status、duration_seconds、segments、`warnings`、`timeline`，失敗的片段附 `stage`（`synthesis`／`delivery`）與 `error`；或 `pending` 與 `next`（`get_speech_clips`） |
 | `get_speech_clips` | 等待多片段工作並寫檔：`job_id`、`output_dir`、`wait_seconds`、`overwrite`、`timeline`；重複呼叫只寫入仍缺少的片段 |
-| `cancel_speech_job` | 取消工作：排隊中立即取消（`cancelled`），執行中在正在生成的那一段（或那一批）完成時停止並捨棄（`cancelling`）；不寫檔；已完成的工作回 `job_finished` |
-| `list_speech_jobs` | 服務仍記得的工作（最新的在前；id、狀態、聲音、進度、文字開頭）：弄丟 `job_id` 時用來找回，不要重送同一段文字 |
-| `unload_model` | 沒有工作在執行或排隊時立即卸載模型，釋放顯存給其他 GPU 工作；否則回 `model_busy`。下一個請求會重新載入 |
+| `generate_sound_effect` | 一段音效：`prompt`、`seconds`（必填，最多 30）、`output_path`、`model`、`format`、`overwrite`、`seed`、`num_inference_steps`、`cfg_scale`、`wait_seconds`。完成時回傳 path、duration_seconds、sample_rate、channels、format、model、kind、seconds_requested、seed（及 `warnings`）；或 `pending` 與 `next`（`get_sound_effect_job`） |
+| `get_sound_effect_job` | 等待音效工作並寫檔：`job_id`、`wait_seconds`、`output_path`、`overwrite` |
+| `generate_sound_effect_clips` | 多段音效：`clips`（`[{id, prompt, seconds?, seed?}]`，最多 100 個）、`seconds`（片段未給時的長度）、`output_dir` 與 `generate_sound_effect` 相同的其他參數。回傳 `completed`／`partial`（附 `recovery`）或 `pending` 與 `next`（`get_sound_effect_clips`） |
+| `get_sound_effect_clips` | 等待多段音效工作並寫檔：`job_id`、`output_dir`、`wait_seconds`、`overwrite` |
+| `cancel_speech_job` | 取消工作（語音與音效皆可）：排隊中立即取消（`cancelled`），執行中在正在生成的那一段（或那一批、那一段音效）完成時停止並捨棄（`cancelling`）；不寫檔；已完成的工作回 `job_finished` |
+| `list_speech_jobs` | 服務仍記得的工作，語音與音效皆列（最新的在前；id、`kind`、狀態、聲音、進度、文字或提示開頭）：弄丟 `job_id` 時用來找回，不要重送 |
+| `unload_model` | 沒有工作在執行或排隊時立即卸載目前的模型（語音模型，或結束音效 worker），釋放顯存給其他 GPU 工作；否則回 `model_busy`。下一個請求會重新載入 |
 | `register_voice` | `name`、`reference_audio_path`（絕對路徑，WAV／FLAC，3–30 秒單人語音）、`description`、`language`、`models`、`replace`。由 tts-mcp 讀檔上傳；註冊後不必重啟即可用於 `voice`。說明中要求：真人的聲音要有使用者明確同意才註冊 |
-| `list_models` / `list_voices` / `tts_status` | 唯讀查詢；`list_voices` 附 `source`（`builtin` 內建、`user` 註冊） |
+| `list_models` / `list_voices` / `tts_status` | 唯讀查詢；`list_models` 附 `kind`（`tts`／`sfx`），音效模型另附 `sfx`（秒數範圍、取樣率、worker 是否安裝、compile 狀態）；`list_voices` 附 `source`（`builtin` 內建、`user` 註冊） |
+
+音效工作的接續方式與語音相同：`pending` 結果的 `next.tool` 一定是同類工作的取回工具。用語音的取回工具（`get_speech_job`／`get_speech_clips`）取音效工作，或反過來，會回 `wrong_job_kind`（附 `tool`：應使用的工具）且不寫任何檔案；MCP 重啟後也一樣（工作種類向服務查詢）。所有工具都拒絕未知參數（`unsupported_parameter`），例如音效工具不接受 `voice`、`language`、`timeline`。
 
 `timeline`：每段一筆 `{index, paragraph, start, end, text}`（秒，相對於輸出檔；不含段間靜音）。段落（空行）一定從新的一段開始，所以一次長呼叫也能依段落切分影片或投影片。預設不回傳，因為它會重複整份輸入文字。`pending` 結果的 `next.arguments` 與錯誤的 `recovery` 會保留 `timeline`。
 
@@ -151,20 +176,20 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 
 | Agent | 安裝位置 |
 |---|---|
-| Claude Code | `~/.claude/skills/narration/SKILL.md`（user-level skill，依 description 自動觸發） |
-| Codex | `~/.codex/AGENTS.md` 中 `<!-- local-tts:begin -->`…`<!-- local-tts:end -->` 之間的區塊（其餘內容不動；第一次安裝前備份為 `AGENTS.md.bak-local-tts`） |
+| Claude Code | `~/.claude/skills/narration/SKILL.md` 與 `~/.claude/skills/sound-effects/SKILL.md`（user-level skill，依 description 自動觸發） |
+| Codex | `~/.codex/AGENTS.md` 中 `<!-- local-tts:begin -->`…`<!-- local-tts:end -->`（旁白）與 `<!-- local-tts-sfx:begin -->`…`<!-- local-tts-sfx:end -->`（音效）之間的區塊（其餘內容不動；任一組標記不成對時整個檔案都不改並報錯；第一次安裝前備份為 `AGENTS.md.bak-local-tts`） |
 
-規則內容：觸發情境（影片旁白、簡報配音、教材朗讀、有聲內容；只要文字稿時不觸發）、為耳朵寫稿（數字讀法、`[pause]`、拼音修正讀音）、模型與聲音選擇（未指定 `voice` 時每次呼叫音色不同，多段需同一旁白者時固定同一 `voice`）、輸出放在任務專案目錄、依用途切分檔案（每個場景／投影片一檔，用 `generate_speech_clips` 一次生成）、`pending` 時照 `next` 接續、註冊聲音需使用者同意、旁白完成後可 `unload_model`、交給 ffmpeg 合成的方式與錯誤處理。修改規則後重新執行安裝腳本。
+規則內容：觸發情境（影片旁白、簡報配音、教材朗讀、有聲內容；只要文字稿時不觸發）、為耳朵寫稿（數字讀法、`[pause]`、拼音修正讀音）、模型與聲音選擇（未指定 `voice` 時每次呼叫音色不同，多段需同一旁白者時固定同一 `voice`）、輸出放在任務專案目錄、依用途切分檔案（每個場景／投影片一檔，用 `generate_speech_clips` 一次生成）、`pending` 時照 `next` 接續、註冊聲音需使用者同意、旁白完成後可 `unload_model`、交給 ffmpeg 合成的方式與錯誤處理。音效規則：何時使用（非語音的聲音；語音用旁白規則，背景音樂與歌曲不適用）、具體描述聲源與動作、`seconds` ≤ 30、同一成品的所有音效用一次 `generate_sound_effect_clips`、旁白與音效分批生成不交錯（切換模型要數十秒）、用 ffmpeg `adelay`／`amix` 自行放到時間軸、用 ffprobe／volumedetect（及可用時的音訊模型）檢查、不符時換 `seed` 或更具體的描述重生成、`pending` 與錯誤的處理、沒有 MCP 時的 CLI。修改規則後重新執行安裝腳本。
 
 ## 設定
 
 | 檔案 | 內容 |
 |---|---|
-| `config/server.yaml` | 監聽位址／埠（預設 `127.0.0.1:8765`）、佇列上限、閒置卸載秒數、工作保留時間、同步等待上限、切段參數 |
-| `config/models.yaml` | 模型註冊表（`default`、adapter、HF revision、codec 精度、取樣參數、`batch_size`） |
+| `config/server.yaml` | 監聽位址／埠（預設 `127.0.0.1:8765`）、佇列上限、閒置卸載秒數、工作保留時間、同步等待上限、切段參數、音效請求上限 `sfx:`（`max_prompt_chars` 2000、`max_clips` 100、`max_total_seconds` 300） |
+| `config/models.yaml` | 模型註冊表（`default`、`default_sfx`、每個模型的 `kind`（`tts` 預設／`sfx`）、adapter、HF revision、codec 精度、取樣參數、`batch_size`；音效模型另有 `worker`、`max_seconds`、`sample_rate`、`compile`、`load_timeout_seconds`、`generate_timeout_seconds`） |
 | `config/voices.yaml` | 聲音註冊表（名稱、描述、語言、參考音檔、相容模型） |
 
-環境變數：`LOCAL_TTS_CONFIG_DIR`（改用其他設定目錄）、`LOCAL_TTS_PORT`、`LOCAL_TTS_BATCH_SIZE`（覆寫所有模型的 `batch_size`）、`LOCAL_TTS_VOICES_DIR`（註冊聲音的目錄）。
+環境變數：`LOCAL_TTS_CONFIG_DIR`（改用其他設定目錄）、`LOCAL_TTS_PORT`、`LOCAL_TTS_BATCH_SIZE`（覆寫所有語音模型的 `batch_size`）、`LOCAL_TTS_VOICES_DIR`（註冊聲音的目錄）、`LOCAL_TTS_SFX_COMPILE`（`0`／`1`，覆寫音效模型的 `compile`）、`LOCAL_TTS_CACHE_DIR`（torch.compile 的 Inductor／Triton 快取目錄的上層；預設 `$XDG_CACHE_HOME/local-tts`，即 `~/.cache/local-tts`，快取在其下的 `torch-compile/`，保留到下次載入，讓之後的暖機較快）。
 
 批次生成：`batch_size`（預設 1，即關閉）大於 1 時，參考音色確定後，接下來最多 `batch_size` 段的第一次生成會放進同一次批次；每段仍各自做截斷、漏唸、偏短與持續發聲的判定，需要重試或切分的段落改為逐段處理。實測 B=4 約快 2.4 倍、B=8 約快 3.5 倍，顯存多約 0.7／1.6–2.1 GiB（`docs/batch-bench-report.md`）。批次因顯存不足失敗時，該工作其餘部分改為逐段生成，不會報錯。同一個 `seed` 只在相同 `batch_size` 下產生相同音訊。顯存充足的機器可不改 repo，用 systemd drop-in 設定：`systemctl --user edit local-tts`，加入 `[Service]` 與 `Environment=LOCAL_TTS_BATCH_SIZE=4`。
 
@@ -179,14 +204,15 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 
 | 方法 | 路徑 | 說明 |
 |---|---|---|
-| GET | `/health` | 服務狀態、已載入模型、佇列長度、執行中工作、GPU 記憶體、`estimates`（各模型實測的 RTF 與載入秒數）、`voice_config_error`（註冊檔無法讀取時的原因，否則 null） |
-| GET | `/v1/models` | 模型清單：id、是否預設、是否已載入、支援語言、能力、可用選項、`batch_size` |
+| GET | `/health` | 服務狀態、已載入模型、`default_model`／`default_sfx_model`、佇列長度、執行中工作、GPU 記憶體、`estimates`（語音模型實測的 RTF、音效模型每段秒數 `clip_seconds`，以及載入秒數）、`sfx`（各音效模型：是否載入、worker 是否安裝、權重是否已在快取、worker pid、compile 狀態）、`voice_config_error`（註冊檔無法讀取時的原因，否則 null） |
+| GET | `/v1/models` | 模型清單：id、`kind`、是否為該類的預設、是否已載入、支援語言、能力、可用選項；語音模型附 `batch_size`，音效模型附 `sfx` |
 | POST | `/v1/models/unload` | 立即卸載模型：回 `{"unloaded": 模型 id 或 null, "gpu": …}`；有工作執行或排隊時回 409 `model_busy` |
 | GET | `/v1/voices?model=` | 聲音清單：name、描述、語言、相容模型、`source`（`builtin`／`user`） |
 | PUT | `/v1/voices/{name}?description=&language=&models=&replace=` | 註冊聲音：本體是錄音檔本身（上限 16 MiB）；新增回 201、取代回 200 |
 | DELETE | `/v1/voices/{name}` | 移除註冊的聲音（內建聲音回 409 `voice_not_removable`） |
 | POST | `/v1/audio/speech` | 同步生成，直接回傳音訊 bytes（OpenAI 相容子集） |
 | POST | `/v1/jobs` | 非同步生成，回傳 202 與工作 ID（長旁白用，避免呼叫端逾時）；以 `clips` 取代 `input` 時為多片段工作 |
+| POST | `/v1/sfx/jobs` | 音效工作（只有非同步），回傳 202；見「音效」 |
 | GET | `/v1/jobs` | 服務仍記得的工作摘要（最新的在前）：id、狀態、模型、聲音、格式、時間、進度、字數、文字開頭（80 字）、失敗時的 `error_code` |
 | GET | `/v1/jobs/{id}?wait=` | 工作狀態：queued／running／succeeded／failed、佇列位置、段落進度（開始生成時即有 `segments_total`）、`estimated_remaining_seconds`、結果中繼資料（含 `warnings`、`timeline`）或錯誤。`wait`（0–30 秒）為 long poll：工作結束、狀態或進度改變時立即回應，否則等滿 `wait` 秒 |
 | DELETE | `/v1/jobs/{id}` | 取消工作：排隊中 → 200，工作變為 failed（code `cancelled`）；執行中 → 202（`cancel_requested: true`），正在生成的那一段（或那一批）完成時即停止；重複取消 → 200；已完成 → 409 `job_finished` |
@@ -224,6 +250,35 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
   -d '{"input":"你好，歡迎收看。","language":"zh","voice":"demo_zh_female"}' -o hello.wav
 ```
 
+### 音效
+
+`POST /v1/sfx/jobs`（202，只有非同步；沒有同步端點）。工作的查詢、long poll、取消、音訊取回、`Idempotency-Key`、`max_result_bytes` 與保留時間都和語音工作共用 `/v1/jobs…` 端點；同一個 `Idempotency-Key` 只比對同一類的送出，語音與音效不會混淆。
+
+| 欄位 | 必填 | 說明 |
+|---|---|---|
+| `prompt` + `seconds` | 二擇一 | 一段音效；取回時不帶 `clip` |
+| `clips` | 二擇一 | `[{id, prompt, seconds?, seed?}]`，1–`max_clips` 個；`id` 規則同語音的多片段工作；片段沒有 `seconds` 時用最外層的 `seconds` |
+| `seconds` | ✔ | 每段秒數，有限數值，0.1–30（模型的 `max_seconds`）；沒有預設值。模型以 0.1 秒為單位 |
+| `model` | | 省略時用 `models.yaml` 的 `default_sfx` |
+| `seed` | | 0 至 2³²−1。多片段時片段 i 未指定 `seed` 時用 `seed + i`；完全未指定時由服務隨機產生，結果中回報 |
+| `response_format` | | `wav`（預設）、`flac`、`mp3` |
+| `num_inference_steps` / `cfg_scale` | | 取樣覆寫（預設 100／4.0；範圍 1–500／1–20） |
+
+限制（`config/server.yaml` 的 `sfx:`）：每個提示最多 2000 字元、每個工作最多 100 段、所有段合計最多 300 秒。其他欄位（如 `voice`、`language`、`input`、`timeline`）回 `unsupported_parameter`。
+
+- 不做任何語音專用的處理：不切句、不依時長重試、不去除靜音、沒有聲音參考與 `[pause]`。每段各生成一次；模型回報某段失敗只讓該段失敗（`sfx_generation_failed` 等），全部失敗時整個工作失敗；worker 結束或無回應讓整個工作失敗。
+- 取消：排隊中立即取消；執行中在正在生成的那一段完成後停止，該段捨棄。
+- 結果：48 kHz 單聲道；`kind: "sfx"`、`duration`、`seconds_requested`、`seed`、`generation_seconds`（多段時在每段的 `clips` 中）與 `warnings`（例如沒有 C 編譯器而未編譯）。工作狀態的進度為 `clips_done`／`clips_total`；`estimated_remaining_seconds` 依每段秒數計算（與長度無關），模型未載入時加上載入（含編譯暖機）時間，兩者都依本機實測更新。
+- 音訊標頭：`X-TTS-Job-Id`、`X-TTS-Kind`（`sfx`）、`X-TTS-Model`、`X-TTS-Duration`、`X-TTS-Sample-Rate`、`X-TTS-Channels`、`X-TTS-Seed`。
+- 語音端點（`/v1/audio/speech`、`/v1/jobs`）指定音效模型，或音效端點指定語音模型，回 400 `wrong_model_kind`，附 `available`（正確種類的模型）。
+
+速度與顯存（擁有者機器上獨立測試的結果，不是在本服務中量測）：啟用 compile 時，每次載入模型有一次約 30–100 秒的暖機，之後每段約 14 秒、與長度無關（模型每次都對完整 30 秒的 latent 去噪）；未編譯時每段 36 秒以上；顯存約 16 GB。
+
+```bash
+curl -s localhost:8765/v1/sfx/jobs -H 'Content-Type: application/json' \
+  -d '{"clips":[{"id":"door","prompt":"A heavy wooden door slams shut","seconds":3}],"seed":1}'
+```
+
 ### 錯誤
 
 錯誤一律為 `{"error": {"code": ..., "message": ..., ...}}`：
@@ -251,7 +306,14 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 | `invalid_clip_id` | 400 | 多片段工作的片段 id 不合規則或重複；附 `ids` |
 | `clip_required` / `unknown_clip` | 400 / 404 | 取多片段工作的音訊時未指定或指定了不存在的 `clip`；附 `clips` |
 | `clip_failed` | 409 | 該片段生成失敗；附 `clip` 與 `clip_error` |
-| `clips_job` / `not_a_clips_job` | — | 用戶端：工作種類與取回方式不符（多片段工作用 `get_speech_clips`／`tts job -d`，一般工作用 `get_speech_job`／`tts job -o`） |
+| `wrong_model_kind` / `no_sfx_model` | 400 | 語音請求指定音效模型或反之（附 `model_kind`、`available`）／沒有設定音效模型 |
+| `invalid_seconds` / `too_many_seconds` | 400 | 音效：`seconds` 缺少或超出範圍（附 `min_seconds`、`max_seconds`）／合計超過 `max_total_seconds` |
+| `sfx_worker_not_installed` / `model_weights_missing` / `gpu_unavailable` | 503 | 音效：worker 環境未安裝（附 `install_command`）／權重不在快取（附 `download_command`）／沒有可用的 NVIDIA GPU |
+| `sfx_worker_failed` / `sfx_worker_timeout` | 500 | 音效 worker 啟動失敗、結束或無回應（逾時的 worker 會被終止並回收）；下一個工作會啟動新的 worker |
+| `sfx_generation_failed` / `sfx_invalid_output` | 500 | 某段音效失敗（只讓該段失敗） |
+| `model_unload_failed` | 500 | 模型無法卸載（例如 worker 無法回收）；在它釋放之前不會載入其他模型 |
+| `clips_job` / `not_a_clips_job` | — | 用戶端：工作種類與取回方式不符（多片段工作用 `get_speech_clips`／`get_sound_effect_clips`／`tts job -d`，一般工作用 `get_speech_job`／`get_sound_effect_job`／`tts job -o`） |
+| `wrong_job_kind` | — | 用戶端（MCP）：用語音的取回工具取音效工作或反之；附 `tool`（應使用的工具），不寫檔 |
 | `download_incomplete` | — | 用戶端：同一次呼叫的音訊下載超過 30 秒，未寫入的片段再呼叫一次即可 |
 
 ## 長文處理
@@ -277,6 +339,10 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 .venv/bin/python -m pytest -q tests          # 切段、重試／截斷、排程與 API（假 adapter，不需 GPU）
 ```
 
+單元測試不需要 worker 環境或 GPU：音效部分用假 adapter，以及用服務自己的 Python 執行的假 worker 腳本（`tests/fake_sfx_worker.py`）測試真正的傳輸層。
+
+音效實測（需要 GPU 與 worker 環境）：`scripts/sfx_run.sh outputs/sfx/<名稱> [埠]` 從這個 checkout 在非預設埠（預設 8791）啟動服務並執行 `scripts/sfx_smoke.py`（一段音效與 3 段工作，檢查取樣率、時長、非靜音，以及語音 → 音效 → 語音的切換）；埠已被佔用時拒絕執行。先卸載常駐服務的模型（`tts unload`），避免兩份模型搶顯存。`scripts/sfx_mcp_stdio.py <輸出目錄> [埠]` 經 stdio 驅動 `tts-mcp` 的音效工具（需要該埠上的服務正在執行）。
+
 第 4 步驗收（服務需在執行中，約 20 分鐘）：`scripts/step4_all.sh <工作目錄> outputs/step4/<名稱>`。先讓 Claude Code 與 Codex 的正例同時執行（共用 GPU 佇列），再單獨依序跑反例；單一 Agent 或部分任務用 `scripts/step4_run.sh <工作目錄> <輸出目錄> [任務...]`，但反例必須在沒有其他工作時執行。以 headless 模式交給兩個 Agent 實際任務（prompt 不提到 TTS 工具）：製作有旁白的短片、把教材做成可聽的版本，以及只要文字稿的反例。斷言在 `scripts/step4_check.py`：
 - 正例：有工具呼叫與完成結果，音檔位於任務目錄且可解碼；
 - 影片：20–30 秒，涵蓋所有片段，場景切點對齊各段旁白；
@@ -293,4 +359,4 @@ ASR 比對（`scripts/asr_compare.py`）會把每個漏字、多字的地方剪�
 
 ## 授權
 
-本專案以 [Apache License 2.0](LICENSE) 授權。相依的 MOSS-TTS 與內附的 demo 參考音檔同樣是 Apache-2.0，出處見 [NOTICE](NOTICE)；模型權重從 Hugging Face 下載，依其模型頁面的授權使用。
+本專案以 [Apache License 2.0](LICENSE) 授權。相依的 MOSS-TTS（含 MOSS-SoundEffect v2.0 的程式）與內附的 demo 參考音檔同樣是 Apache-2.0，出處見 [NOTICE](NOTICE)；模型權重從 Hugging Face 下載，依其模型頁面的授權使用（MOSS-SoundEffect-v2.0 的模型頁面標示 Apache-2.0）。

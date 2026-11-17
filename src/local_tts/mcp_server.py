@@ -3,7 +3,8 @@
 Waiting in a tool call (submit + polling) is bounded by `wait_seconds` (default 45 s, under Codex's
 default 60 s MCP tool timeout, or LOCAL_TTS_MCP_WAIT when the agent allows longer calls; max 240 s). Only a finished job adds the audio download (<= 30 s).
 A long narration returns status "pending" with a job_id; call get_speech_job(job_id) to keep
-waiting. Jobs are never resubmitted; once a job is known, every error carries its job_id.
+waiting (sound effects: get_sound_effect_job / get_sound_effect_clips; a pending result's "next" names the
+right one). Jobs are never resubmitted; once a job is known, every error carries its job_id.
 """
 import asyncio
 import json
@@ -20,8 +21,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
-from local_tts.client import (ClientError, Deadline, TTSClient, as_client_error, check_target, clip_paths, pending,
-                              resolve_output_dir, resolve_output_path, resumable, with_timeline)
+from local_tts.client import (MCP_TOOLS, ClientError, Deadline, TTSClient, as_client_error, check_target, clip_paths,
+                              job_kind, pending, resolve_output_dir, resolve_output_path, resumable, with_timeline)
 
 MAX_WAIT = 240.0
 
@@ -43,13 +44,14 @@ def _default_wait() -> float:
 
 DEFAULT_WAIT = _default_wait()
 
-INSTRUCTIONS = """Local text-to-speech on this machine's GPU: use it whenever a task needs spoken audio
-(narration, voice-over, reading aloud). Write into the task's project with absolute paths; pass language.
-- Several clips (one per slide or scene): one generate_speech_clips call. Separate calls without a voice
-  sound like different speakers: pass the same voice (list_voices) to calls that must sound alike.
+INSTRUCTIONS = """Local GPU speech and sound effects: use it whenever a task needs spoken audio (narration,
+voice-over, reading aloud) or non-speech sound (effects, foley, ambience; not music). Absolute paths in the project.
+- Speech: pass language. Several clips (one per slide or scene): one generate_speech_clips call. Separate calls
+  without a voice sound like different speakers: pass the same voice (list_voices) to calls that must sound alike.
+- Sound effects: all of a task in one generate_sound_effect_clips call, seconds <= 30 each; speech first or last.
 - "pending": call next.tool with exactly next.arguments until done; never resubmit pending text
   (list_speech_jobs finds a lost job_id). An error with a job_id: follow its "recovery".
-- "warnings" on a result: a sentence may be missing; regenerate that file or clip once (overwrite=true)."""
+- "warnings" on a speech result: a sentence may be missing; regenerate that file or clip once (overwrite=true)."""
 
 # Writing tools create files; with overwrite=true they replace one, hence destructive. Local only.
 WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False)
@@ -89,6 +91,7 @@ class JobEntry:
     """Everything this process knows about one job. The lock is created once per job and guards the
     path decision and the save, so concurrent or repeated get_speech_job calls save each path once."""
     fmt: Optional[str] = None             # the job's audio format (known at submit or from the server)
+    kind: Optional[str] = None            # "tts" or "sfx" (known at submit or from the server)
     default_path: Optional[Path] = None   # output_path given to generate_speech
     default_overwrite: bool = False
     default_timeline: bool = False
@@ -127,11 +130,17 @@ def _error(e: Exception, **context: Any) -> ToolError:
     ce = as_client_error(e)
     err = ce.to_dict()
     clips = "output_dir" in context
-    submit, fetch = ("generate_speech_clips", "get_speech_clips") if clips else ("generate_speech", "get_speech_job")
-    if ce.code == "clips_job":
-        context["recovery"] = "Call get_speech_clips with this job_id and the output_dir for its files."
+    kind = ce.details.get("job_kind") or context.get("kind") or "tts"
+    context.pop("kind", None)
+    submit, fetch = MCP_TOOLS[kind, clips]
+    if ce.code == "wrong_job_kind":
+        context["recovery"] = (f"Nothing was written. Call {ce.details['tool']} with this job_id (and the "
+                               f"{'output_dir' if ce.details['tool'].endswith('clips') else 'output_path'} "
+                               "for its audio) instead.")
+    elif ce.code == "clips_job":
+        context["recovery"] = f"Call {MCP_TOOLS[kind, True][1]} with this job_id and the output_dir for its files."
     elif ce.code == "not_a_clips_job":
-        context["recovery"] = "Call get_speech_job with this job_id and the output_path for its file."
+        context["recovery"] = f"Call {MCP_TOOLS[kind, False][1]} with this job_id and the output_path for its file."
     elif not resumable(ce):  # failed or forgotten: waiting again would only repeat this error
         context["recovery"] = ("The job failed or the service no longer has it (restarted or expired); it cannot "
                                "be resumed. Fix the cause above if there is one (e.g. rephrase or shorten the "
@@ -178,12 +187,42 @@ def _clips_args(job_id: str, directory, overwrite: bool, timeline: bool) -> dict
     return args
 
 
-def _pending(job_id: str, pend: dict, path: Optional[Path], overwrite: bool, timeline: bool) -> dict[str, Any]:
-    """A pending result names its target file and the exact call to keep waiting."""
+def _pending(job_id: str, pend: dict, path: Optional[Path], overwrite: bool, timeline: bool,
+             kind: str = "tts") -> dict[str, Any]:
+    """A pending result names its target file and the exact call to keep waiting (a tool of the job's kind)."""
     if path is None:
         return pend
     return pend | {"output_path": str(path), "next": {
-        "tool": "get_speech_job", "arguments": _resume_args(job_id, path, overwrite, timeline)}}
+        "tool": MCP_TOOLS[kind, False][1], "arguments": _resume_args(job_id, path, overwrite, timeline)}}
+
+
+async def _check_kind(job_id: str, entry: JobEntry, kind: str, clips: bool, deadline: Deadline,
+                      last: Optional[dict]) -> Optional[dict]:
+    """Learn the job's kind (and format) if this process does not know them, and refuse a tool of the other
+    kind before anything is written. Returns the snapshot it fetched (or `last`)."""
+    if entry.kind is None or entry.fmt is None:
+        last = await client.job(job_id, timeout=deadline.request_timeout(10.0))
+        entry.kind, entry.fmt = job_kind(last), last["format"]
+    if entry.kind != kind:
+        if last is None:  # whether it is a clips job decides which tool to name
+            last = await client.job(job_id, timeout=deadline.request_timeout(10.0))
+        is_clips = last.get("clips_total") is not None
+        right = MCP_TOOLS[entry.kind, is_clips][1]
+        what = {"tts": "speech", "sfx": "sound-effect"}
+        raise ClientError("wrong_job_kind", f"Job {job_id} is a {what[entry.kind]} job; {MCP_TOOLS[kind, clips][1]} "
+                          f"only fetches {what[kind]} jobs: use {right}.", job_id=job_id, job_kind=entry.kind,
+                          tool=right)
+    return last
+
+
+def _check_shape(job_id: str, job: Optional[dict], kind: str, clips: bool) -> None:
+    """Refuse a one-audio getter for a clips job, or the reverse, once the job's snapshot is known."""
+    if job is None or (job.get("clips_total") is not None) == clips:
+        return
+    if clips:
+        raise ClientError("not_a_clips_job", f"Job {job_id} has one audio: use {MCP_TOOLS[kind, False][1]}.",
+                          job_id=job_id)
+    raise ClientError("clips_job", f"Job {job_id} is a clips job: use {MCP_TOOLS[kind, True][1]}.", job_id=job_id)
 
 
 def _target(entry: JobEntry, output_path: Optional[str], overwrite: bool) -> tuple[Optional[Path], bool]:
@@ -196,21 +235,22 @@ def _target(entry: JobEntry, output_path: Optional[str], overwrite: bool) -> tup
 
 
 async def _deliver(job_id: str, entry: JobEntry, output_path: Optional[str], overwrite: bool, timeline: bool,
-                   deadline: Deadline, last: Optional[dict] = None) -> dict[str, Any]:
+                   deadline: Deadline, last: Optional[dict] = None, kind: str = "tts") -> dict[str, Any]:
     """Under the job's lock: pick the target path, wait (within the deadline) and save it once."""
     timeline = timeline or entry.default_timeline
+    # Recovered after a restart: ask the server for the job's kind and format, and refuse the wrong kind
+    # before anything else (also before a continuation is built for a call that holds the lock).
+    last = await _check_kind(job_id, entry, kind, False, deadline, last)
     try:
         async with asyncio.timeout(deadline.remaining() or 0.01):
             await entry.lock.acquire()
     except TimeoutError:  # another call for this job holds the lock until its own deadline
-        pend = pending(last or await client.job(job_id, timeout=deadline.request_timeout(10.0)))
+        job = last or await client.job(job_id, timeout=deadline.request_timeout(10.0))
+        _check_shape(job_id, job, kind, False)
         path = Path(output_path) if output_path else entry.default_path
-        return _pending(job_id, pend, path, overwrite or (path == entry.default_path and entry.default_overwrite),
-                        timeline)
+        return _pending(job_id, pending(job), path,
+                        overwrite or (path == entry.default_path and entry.default_overwrite), timeline, kind)
     try:
-        if entry.fmt is None:  # recovered after a restart: ask the server for the job's format
-            last = await client.job(job_id, timeout=deadline.request_timeout(10.0))
-            entry.fmt = last["format"]
         path, overwrite = _target(entry, output_path, overwrite)
         if path is None:  # recovered without a path: keep using the same default file
             path, _ = resolve_output_path(None, entry.fmt)
@@ -219,9 +259,10 @@ async def _deliver(job_id: str, entry: JobEntry, output_path: Optional[str], ove
             return with_timeline(entry.saved[path], timeline)
         job = await client.wait(job_id, deadline, last=last)
         if job.get("clips_total") is not None:
-            raise ClientError("clips_job", f"Job {job_id} is a clips job: use get_speech_clips.", job_id=job_id)
+            raise ClientError("clips_job", f"Job {job_id} is a clips job: use {MCP_TOOLS[kind, True][1]}.",
+                              job_id=job_id)
         if job["status"] in ("queued", "running"):
-            return _pending(job_id, pending(job), path, overwrite, timeline)
+            return _pending(job_id, pending(job), path, overwrite, timeline, kind)
         result = await client.save(job, path, overwrite)
         entry.saved[path] = result
         log.info("job %s saved to %s", job_id, path)
@@ -237,50 +278,75 @@ async def _generate(text, output_path, language, voice, model, fmt, overwrite, s
     check_target(path, overwrite)
     job = await client.submit(text, model=model, voice=voice, language=language, fmt=fmt, seed=seed,
                               deadline=deadline)
+    return await _started("tts", job, path, fmt, overwrite, timeline, deadline)
+
+
+async def _generate_sfx(prompt, seconds, output_path, model, fmt, overwrite, seed, steps, cfg_scale,
+                        wait_seconds) -> dict[str, Any]:
+    deadline = Deadline(_clamp_wait(wait_seconds))
+    path, fmt = resolve_output_path(output_path, fmt)
+    check_target(path, overwrite)
+    job = await client.submit_sfx(prompt, seconds=seconds, model=model, fmt=fmt, seed=seed,
+                                  num_inference_steps=steps, cfg_scale=cfg_scale, deadline=deadline)
+    return await _started("sfx", job, path, fmt, overwrite, False, deadline)
+
+
+async def _started(kind: str, job: dict, path: Path, fmt: str, overwrite: bool, timeline: bool,
+                   deadline: Deadline) -> dict[str, Any]:
+    """After a one-audio submission (either kind): remember the job, then wait and save within the deadline."""
     entry = _entry(job["id"])
-    entry.fmt, entry.default_path, entry.default_overwrite, entry.default_timeline = fmt, path, overwrite, timeline
-    log.info("job %s submitted -> %s", job["id"], path)
+    entry.kind, entry.fmt, entry.default_path = kind, fmt, path
+    entry.default_overwrite, entry.default_timeline = overwrite, timeline
+    log.info("%s job %s submitted -> %s", kind, job["id"], path)
     try:
-        return await _deliver(job["id"], entry, None, False, False, deadline, last=job)
+        return await _deliver(job["id"], entry, None, False, False, deadline, last=job, kind=kind)
     except Exception as e:  # noqa: BLE001 - attach the job so the caller can recover
         _forget(job["id"], e)
-        raise _error(e, job_id=job["id"], output_path=str(path), overwrite=overwrite, timeline=timeline) from None
+        raise _error(e, job_id=job["id"], output_path=str(path), overwrite=overwrite, timeline=timeline,
+                     kind=kind) from None
 
 
 async def _deliver_clips(job_id: str, entry: JobEntry, output_dir: Optional[str], overwrite: bool, timeline: bool,
-                         deadline: Deadline, last: Optional[dict] = None) -> dict[str, Any]:
+                         deadline: Deadline, last: Optional[dict] = None, kind: str = "tts") -> dict[str, Any]:
     """The clips counterpart of _deliver: wait within the deadline, then write every clip once."""
     timeline = timeline or entry.default_timeline
+    last = await _check_kind(job_id, entry, kind, True, deadline, last)  # the kind first, then the shape
+    _check_shape(job_id, last, kind, True)
+    if last is None and entry.default_dir is None and entry.default_path is not None:
+        _check_shape(job_id, {"clips_total": None}, kind, True)  # submitted here as a one-audio job
     directory = resolve_output_dir(output_dir) if output_dir else entry.default_dir
     if directory is None:
-        raise ClientError("invalid_path", "Pass output_dir: the directory given to generate_speech_clips.")
+        raise ClientError("invalid_path", f"Pass output_dir: the directory given to {MCP_TOOLS[kind, True][0]}.")
     overwrite = overwrite or (directory == entry.default_dir and entry.default_overwrite)
     try:
         async with asyncio.timeout(deadline.remaining() or 0.01):
             await entry.lock.acquire()
     except TimeoutError:  # another call for this job holds the lock until its own deadline
         job = last or await client.job(job_id, timeout=deadline.request_timeout(10.0))
-        return _clips_pending(job_id, job, directory, overwrite, timeline)
+        _check_shape(job_id, job, kind, True)
+        return _clips_pending(job_id, job, directory, overwrite, timeline, kind)
     try:
         job = await client.wait(job_id, deadline, last=last)
         if job.get("clips_total") is None:
-            raise ClientError("not_a_clips_job", f"Job {job_id} has one audio: use get_speech_job.", job_id=job_id)
+            raise ClientError("not_a_clips_job", f"Job {job_id} has one audio: use {MCP_TOOLS[kind, False][1]}.",
+                              job_id=job_id)
         if job["status"] in ("queued", "running"):
-            return _clips_pending(job_id, job, directory, overwrite, timeline)
+            return _clips_pending(job_id, job, directory, overwrite, timeline, kind)
         result = await client.save_clips(job, directory, overwrite)  # skips files already identical
         log.info("job %s: %d clip(s) in %s, status %s", job_id, len(result["clips"]), directory, result["status"])
-        return _clips_recovery(with_timeline(result, timeline), overwrite, timeline)
+        return _clips_recovery(with_timeline(result, timeline), overwrite, timeline, kind)
     finally:
         entry.lock.release()
 
 
-def _clips_pending(job_id: str, job: dict, directory: Path, overwrite: bool, timeline: bool) -> dict[str, Any]:
+def _clips_pending(job_id: str, job: dict, directory: Path, overwrite: bool, timeline: bool,
+                   kind: str = "tts") -> dict[str, Any]:
     return pending(job) | {"clips_total": job.get("clips_total"), "output_dir": str(directory),
-                           "next": {"tool": "get_speech_clips",
+                           "next": {"tool": MCP_TOOLS[kind, True][1],
                                     "arguments": _clips_args(job_id, directory, overwrite, timeline)}}
 
 
-def _clips_recovery(result: dict[str, Any], overwrite: bool, timeline: bool) -> dict[str, Any]:
+def _clips_recovery(result: dict[str, Any], overwrite: bool, timeline: bool, kind: str = "tts") -> dict[str, Any]:
     """A partial result says what to do about each kind of failed clip."""
     if result["status"] == "completed":
         return result
@@ -288,13 +354,14 @@ def _clips_recovery(result: dict[str, Any], overwrite: bool, timeline: bool) -> 
     synth = [c["id"] for c in result["clips"] if c.get("stage") == "synthesis"]
     deliver = [c for c in result["clips"] if c.get("stage") == "delivery"]
     if synth:
+        how = "same voice" if kind == "tts" else "another seed or a more concrete prompt"
         notes.append(f"Clips {', '.join(synth)} failed in synthesis (see each error): fix the cause if there is one "
-                     "and call generate_speech_clips with only those clips (same voice).")
+                     f"and call {MCP_TOOLS[kind, True][0]} with only those clips ({how}).")
     if deliver:
         exists = any(c["error"].get("code") == "output_exists" for c in deliver)
         args = _clips_args(result["job_id"], result["output_dir"], overwrite or exists, timeline)
         notes.append(f"Clips {', '.join(c['id'] for c in deliver)} were not written (see each error): call "
-                     f"get_speech_clips with {json.dumps(args, ensure_ascii=False)}"
+                     f"{MCP_TOOLS[kind, True][1]} with {json.dumps(args, ensure_ascii=False)}"
                      + (" (overwrite replaces the existing files)." if exists and not overwrite else "."))
     return result | {"recovery": " ".join(notes)}
 
@@ -308,34 +375,54 @@ async def _generate_clips(clips, output_dir, language, voice, model, fmt, overwr
         check_target(path, overwrite)
     job = await client.submit(None, clips=[(c.id, c.text) for c in clips], model=model, voice=voice,
                               language=language, fmt=fmt, seed=seed, deadline=deadline)
+    return await _started_clips("tts", job, directory, fmt, overwrite, timeline, deadline, len(clips))
+
+
+async def _generate_sfx_clips(clips, seconds, output_dir, model, fmt, overwrite, seed, steps, cfg_scale,
+                              wait_seconds) -> dict[str, Any]:
+    deadline = Deadline(_clamp_wait(wait_seconds))
+    directory = resolve_output_dir(output_dir)
+    fmt = fmt or "wav"
+    for path in clip_paths(directory, [c.id for c in clips], fmt).values():
+        check_target(path, overwrite)
+    job = await client.submit_sfx(None, clips=[c.model_dump() for c in clips], seconds=seconds, model=model,
+                                  fmt=fmt, seed=seed, num_inference_steps=steps, cfg_scale=cfg_scale,
+                                  deadline=deadline)
+    return await _started_clips("sfx", job, directory, fmt, overwrite, False, deadline, len(clips))
+
+
+async def _started_clips(kind: str, job: dict, directory: Path, fmt: str, overwrite: bool, timeline: bool,
+                         deadline: Deadline, count: int) -> dict[str, Any]:
     entry = _entry(job["id"])
-    entry.fmt, entry.default_dir, entry.default_overwrite, entry.default_timeline = fmt, directory, overwrite, timeline
-    log.info("clips job %s submitted (%d clips) -> %s", job["id"], len(clips), directory)
+    entry.kind, entry.fmt, entry.default_dir = kind, fmt, directory
+    entry.default_overwrite, entry.default_timeline = overwrite, timeline
+    log.info("%s clips job %s submitted (%d clips) -> %s", kind, job["id"], count, directory)
     try:
-        return await _deliver_clips(job["id"], entry, None, False, False, deadline, last=job)
+        return await _deliver_clips(job["id"], entry, None, False, False, deadline, last=job, kind=kind)
     except Exception as e:  # noqa: BLE001 - attach the job so the caller can recover
         _forget(job["id"], e)
-        raise _error(e, job_id=job["id"], output_dir=str(directory), overwrite=overwrite, timeline=timeline) from None
+        raise _error(e, job_id=job["id"], output_dir=str(directory), overwrite=overwrite, timeline=timeline,
+                     kind=kind) from None
 
 
-async def _get_clips(job_id, wait_seconds, output_dir, overwrite, timeline) -> dict[str, Any]:
+async def _get_clips(job_id, wait_seconds, output_dir, overwrite, timeline, kind="tts") -> dict[str, Any]:
     deadline = Deadline(_clamp_wait(wait_seconds))
     entry = _entry(job_id)
     try:
-        return await _deliver_clips(job_id, entry, output_dir, overwrite, timeline, deadline)
+        return await _deliver_clips(job_id, entry, output_dir, overwrite, timeline, deadline, kind=kind)
     except Exception as e:  # noqa: BLE001
         _forget(job_id, e)
         directory = output_dir or (str(entry.default_dir) if entry.default_dir else None)
         raise _error(e, job_id=job_id, output_dir=directory,
                      overwrite=overwrite or (entry.default_overwrite and directory == str(entry.default_dir)),
-                     timeline=timeline or entry.default_timeline) from None
+                     timeline=timeline or entry.default_timeline, kind=kind) from None
 
 
-async def _get_job(job_id, wait_seconds, output_path, overwrite, timeline) -> dict[str, Any]:
+async def _get_job(job_id, wait_seconds, output_path, overwrite, timeline, kind="tts") -> dict[str, Any]:
     deadline = Deadline(_clamp_wait(wait_seconds))
     entry = _entry(job_id)
     try:
-        return await _deliver(job_id, entry, output_path, overwrite, timeline, deadline)
+        return await _deliver(job_id, entry, output_path, overwrite, timeline, deadline, kind=kind)
     except Exception as e:  # noqa: BLE001
         _forget(job_id, e)
         try:
@@ -343,7 +430,7 @@ async def _get_job(job_id, wait_seconds, output_path, overwrite, timeline) -> di
         except ClientError:
             path = output_path
         raise _error(e, job_id=job_id, output_path=str(path) if path else None, overwrite=overwrite,
-                     timeline=timeline or entry.default_timeline) from None
+                     timeline=timeline or entry.default_timeline, kind=kind) from None
 
 
 async def _cancel(job_id) -> dict[str, Any]:
@@ -357,13 +444,13 @@ async def _cancel(job_id) -> dict[str, Any]:
             err["recovery"] = "Nothing to cancel: the job is over or the service no longer has it."
         else:  # interrupted: the cancel may or may not have arrived
             err["recovery"] = ("Call cancel_speech_job again with the same job_id (repeating it is harmless). "
-                               "Do not call get_speech_job: it would save the unwanted audio.")
+                               "Do not call get_speech_job or get_sound_effect_job: it would save the unwanted audio.")
         raise ToolError(json.dumps({"error": err}, ensure_ascii=False)) from None
     if job["status"] == "failed":
         return {"status": "cancelled", "job_id": job_id}
     return {"status": "cancelling", "job_id": job_id, "job_status": job["status"],
-            "message": "The job stops as soon as the segment (or batch of segments) being generated "
-                       "finishes; nothing is written."}
+            "message": "The job stops as soon as the speech segment (or batch) or sound effect being "
+                       "generated finishes; nothing is written."}
 
 
 async def _run(fn, *args) -> Any:
@@ -504,31 +591,152 @@ async def get_speech_clips(
     return await _run(_get_clips, job_id, wait_seconds, output_dir, overwrite, timeline)
 
 
+@server.tool(annotations=WRITES)
+async def generate_sound_effect(
+    prompt: str,
+    seconds: float,
+    output_path: Optional[str] = None,
+    model: Optional[str] = None,
+    format: Optional[Literal["wav", "flac", "mp3"]] = None,
+    overwrite: bool = False,
+    seed: Optional[int] = None,
+    num_inference_steps: Optional[int] = None,
+    cfg_scale: Optional[float] = None,
+    wait_seconds: float = DEFAULT_WAIT,
+) -> dict[str, Any]:
+    """Generate one sound effect (foley, ambience, UI sound, impact; not speech, not music) and write it
+    to an audio file (48 kHz mono). For several effects of one task use generate_sound_effect_clips once.
+
+    Args:
+        prompt: The sound, concretely: source, action, surface, distance (English or Chinese).
+        seconds: Length in seconds, required, at most 30.
+        output_path: Absolute path of the file to write (.wav, .flac or .mp3), normally inside the
+            task's project directory. Default: ~/.local/share/local-tts/output/<timestamp>.wav
+        model: Sound-effect model id from list_models. Omit for the default one.
+        format: wav | flac | mp3. Inferred from the output_path extension when omitted.
+        overwrite: Replace output_path if it already exists (otherwise that is an error).
+        seed: Optional integer (0..2**32-1); another seed gives another take of the same prompt.
+        num_inference_steps, cfg_scale: Sampling overrides (defaults 100 and 4.0); rarely needed.
+        wait_seconds: How long this call waits (max 240). The first effect after the model loads is slow.
+
+    Returns: status "completed" with path, duration_seconds, sample_rate, channels, format, model,
+    seconds_requested, seed (plus "warnings", e.g. the model runs uncompiled); or status "pending" with
+    job_id and "next" ({"tool": "get_sound_effect_job", "arguments": {...}}): call it until done.
+    Errors are JSON {"error": {"code", "message", ...}}, with job_id and recovery once the job exists.
+    """
+    return await _run(_generate_sfx, prompt, seconds, output_path, model, format, overwrite, seed,
+                      num_inference_steps, cfg_scale, wait_seconds)
+
+
+@server.tool(annotations=WRITES)
+async def get_sound_effect_job(
+    job_id: str,
+    wait_seconds: float = DEFAULT_WAIT,
+    output_path: Optional[str] = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Wait for a pending generate_sound_effect job and write its audio when done. Calling it again
+    after completion returns the same result.
+
+    Args:
+        job_id: The job_id returned by generate_sound_effect.
+        wait_seconds: How long this call waits (max 240) before returning "pending" again.
+        output_path: The absolute path given to generate_sound_effect; always pass it (as in "next").
+        overwrite: Replace an existing file at the target path.
+    """
+    return await _run(_get_job, job_id, wait_seconds, output_path, overwrite, False, "sfx")
+
+
+class SfxClip(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="File name without extension: letters, digits, '_', '-', '.' (e.g. \"door_slam\").")
+    prompt: str = Field(description="The sound, concretely: source, action, surface, distance.")
+    seconds: Optional[float] = Field(default=None, description="Length (at most 30); default: the call's seconds.")
+    seed: Optional[int] = Field(default=None, description="Seed of this clip; default: the call's seed + index.")
+
+
+@server.tool(annotations=WRITES)
+async def generate_sound_effect_clips(
+    clips: list[SfxClip],
+    seconds: Optional[float] = None,
+    output_dir: Optional[str] = None,
+    model: Optional[str] = None,
+    format: Optional[Literal["wav", "flac", "mp3"]] = None,
+    overwrite: bool = False,
+    seed: Optional[int] = None,
+    num_inference_steps: Optional[int] = None,
+    cfg_scale: Optional[float] = None,
+    wait_seconds: float = DEFAULT_WAIT,
+) -> dict[str, Any]:
+    """Generate several sound effects in one job (the model loads once), each to <output_dir>/<id>.<format>
+    (48 kHz mono). Put every effect of one deliverable in a single call; place them on your timeline
+    afterwards (e.g. ffmpeg adelay + amix).
+
+    Args:
+        clips: [{"id": "door", "prompt": "...", "seconds": 3, "seed": 1}, ...], up to 100; seconds and seed
+            are optional per clip.
+        seconds: Length of every clip that gives none (each clip needs one; at most 30; 300 s per job).
+        output_dir: Absolute directory for the files (created if missing), normally inside the task's
+            project. Default: a new folder under ~/.local/share/local-tts/output/.
+        model, format, overwrite, seed, num_inference_steps, cfg_scale, wait_seconds: as in
+            generate_sound_effect, for all clips (format default wav).
+
+    Returns: status "completed" (every clip written) or "partial", with output_dir, format, model and
+    "clips": per clip id, path, status ("completed" with duration_seconds, seconds_requested, seed; or
+    "failed" with stage and error), plus "recovery" for failed clips. Or status "pending" with job_id and
+    "next" ({"tool": "get_sound_effect_clips", "arguments": {...}}): call it until done.
+    """
+    return await _run(_generate_sfx_clips, clips, seconds, output_dir, model, format, overwrite, seed,
+                      num_inference_steps, cfg_scale, wait_seconds)
+
+
+@server.tool(annotations=WRITES)
+async def get_sound_effect_clips(
+    job_id: str,
+    output_dir: Optional[str] = None,
+    wait_seconds: float = DEFAULT_WAIT,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Wait for a pending generate_sound_effect_clips job and write its clips when done. Calling it again
+    returns the same result and only writes clips that are still missing.
+
+    Args:
+        job_id: The job_id from generate_sound_effect_clips.
+        output_dir: The directory given to generate_sound_effect_clips; always pass it (as in "next").
+        wait_seconds: How long this call waits (max 240) before returning "pending" again.
+        overwrite: Replace existing files (e.g. after output_exists for some clips).
+    """
+    return await _run(_get_clips, job_id, wait_seconds, output_dir, overwrite, False, "sfx")
+
+
 @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True,
                                          open_world_hint=False))
 async def cancel_speech_job(job_id: str) -> dict[str, Any]:
-    """Cancel a generate_speech job you no longer need (wrong text, superseded script), so the GPU and
-    queue are free for the next one. A queued job stops at once ("cancelled"); a running one stops
-    when the segment (or batch) being generated finishes ("cancelling"). No file is written. Cancelling a job that already
-    completed is an error (job_finished)."""
+    """Cancel a speech or sound-effect job you no longer need (wrong text or prompt, superseded script), so
+    the GPU and queue are free for the next one. A queued job stops at once ("cancelled"); a running one
+    stops when the speech segment (or batch) or sound effect being generated finishes ("cancelling"). No
+    file is written. Cancelling a job that already completed is an error (job_finished)."""
     return await _run(_cancel, job_id)
 
 
 @server.tool(annotations=READS)
 async def list_speech_jobs() -> list[dict[str, Any]]:
-    """Jobs the service still knows (about an hour after they finish), newest first: id, status, voice,
-    created/finished times, progress and the start of the text. Use it to find a job_id you lost (e.g.
-    after a context reset) instead of submitting the same text again; then call get_speech_job."""
+    """Speech and sound-effect jobs the service still knows (about an hour after they finish), newest
+    first: id, kind ("tts" or "sfx"), status, voice, created/finished times, progress and the start of the
+    text or prompts. Use it to find a job_id you lost (e.g. after a context reset) instead of submitting
+    again; then call the getter of its kind (get_speech_job / _clips, get_sound_effect_job / _clips)."""
     return await _run(client.jobs)
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
                                          open_world_hint=False))
 async def unload_model() -> dict[str, Any]:
-    """Unload the TTS model from the GPU now, to free its memory for other GPU work (Blender, another
-    model). Call it only when all narration for the task is done: the next speech request loads the
-    model again (tens of seconds). Refused with model_busy while a job runs or waits. Without it the
-    model unloads by itself after the service has been idle for a while (tts_status: idle_unload_seconds)."""
+    """Unload the loaded model (speech, or the sound-effect worker) from the GPU now, to free its memory
+    for other GPU work (Blender, another model). Call it only when all audio for the task is done: the
+    next request loads a model again (tens of seconds). Refused with model_busy while a job runs or waits.
+    Without it the model unloads by itself after the service has been idle for a while (tts_status:
+    idle_unload_seconds)."""
     return await _run(client.unload)
 
 
@@ -562,11 +770,12 @@ async def register_voice(
 
 @server.tool(annotations=READS)
 async def list_models() -> list[dict[str, Any]]:
-    """List TTS models: id, whether it is the default, whether it is loaded, supported languages,
-    capabilities (clone, pause_marker, pinyin, ...) and accepted options."""
+    """List models: id, kind ("tts" speech or "sfx" sound effects), whether it is the default of its kind,
+    whether it is loaded, supported languages, capabilities (clone, pause_marker, pinyin, ...) and accepted
+    options; sound-effect models also give "sfx" (seconds range, sample rate, worker installed, compile)."""
     models = await _run(client.models)
-    return [{k: m[k] for k in ("id", "description", "default", "loaded", "languages", "capabilities", "options")}
-            for m in models]
+    keys = ("id", "kind", "description", "default", "loaded", "languages", "capabilities", "options", "sfx")
+    return [{k: m[k] for k in keys if k in m} for m in models]
 
 
 @server.tool(annotations=READS)
@@ -579,7 +788,8 @@ async def list_voices(model: Optional[str] = None) -> list[dict[str, Any]]:
 
 @server.tool(annotations=READS)
 async def tts_status() -> dict[str, Any]:
-    """Service health: loaded model, queue length, running job, GPU memory."""
+    """Service health: loaded model, default speech and sound-effect models, queue length, running job,
+    per-model time estimates, sound-effect worker status (installed, compile active) and GPU memory."""
     return await _run(client.health)
 
 

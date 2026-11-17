@@ -13,12 +13,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from local_tts.audio import FORMATS, encode
 from local_tts.config import ServerConfig
 from local_tts.engine import ModelManager, SynthesisRequest, synthesize
 from local_tts.errors import TTSError
+from local_tts.sfx import SoundEffectRequest, generate_effects
 from local_tts.text import PAUSE_RE, estimate_seconds
 
 log = logging.getLogger(__name__)
@@ -27,12 +28,17 @@ log = logging.getLogger(__name__)
 # estimated second of speech, and seconds to load a model. Each finished job / load updates them.
 DEFAULT_RTF = 0.75
 DEFAULT_LOAD_SECONDS = 20.0
+# Sound effects take about the same time per clip whatever its length (the model always denoises its
+# full-length latent): ~14 s compiled, >= 36 s uncompiled on the first test machine. Loading includes
+# the torch.compile warm-up. Measured per model like the speech figures.
+DEFAULT_SFX_CLIP_SECONDS = 40.0
+DEFAULT_SFX_LOAD_SECONDS = 120.0
 EWMA_WEIGHT = 0.3  # weight of the newest measurement
 
 
 @dataclass
 class Job:
-    request: SynthesisRequest
+    request: Union[SynthesisRequest, SoundEffectRequest]
     key: Optional[str] = None  # client idempotency key: resubmitting with it returns this job
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
     status: str = "queued"  # queued | running | succeeded | failed (a cancelled job fails with code "cancelled")
@@ -49,6 +55,7 @@ class Job:
     error_http_status: int = 500
     cancel_requested: bool = False
     est_seconds: float = 0.0  # estimated speech (pauses excluded) in the input, for wait estimates
+    # For sound effects, segments_done / segments_total count clips.
     done: threading.Event = field(default_factory=threading.Event)
 
 
@@ -59,12 +66,14 @@ class Scheduler:
         self.cond = threading.Condition()
         self.pending: collections.deque[Job] = collections.deque()
         self.jobs: dict[str, Job] = {}
-        self.keys: dict[str, Job] = {}
+        # (request kind, idempotency key) -> job: a speech and a sound-effect submission never share a key.
+        self.keys: dict[tuple[str, str], Job] = {}
         self.running: Optional[Job] = None
         self.last_activity = time.monotonic()
         # Measured on this machine (per model): synthesis seconds per estimated speech second, load seconds.
         self.rtf: dict[str, float] = {}
         self.load_seconds: dict[str, float] = {}
+        self.clip_seconds: dict[str, float] = {}  # sound effects: generation seconds per clip
         self.janitor_interval = 30.0
         self._stop = False
         self._thread = threading.Thread(target=self._worker, name="gpu-worker", daemon=True)
@@ -86,15 +95,23 @@ class Scheduler:
             self._stop = True
             self.cond.notify_all()
         self._thread.join(timeout=5)
+        if self._thread.ident is not None and not self._thread.is_alive():
+            # Stop a model worker subprocess cleanly (speech models just free memory before exit).
+            try:
+                self.manager.unload()
+            except TTSError as e:
+                log.error("unload at shutdown failed: %s", e.message)
 
-    def submit(self, req: SynthesisRequest, key: Optional[str] = None) -> tuple[Job, bool]:
-        """Queue a request; returns (job, created). A known `key` returns its existing job, so a
-        client that lost the response to a submission can retry it without generating twice."""
+    def submit(self, req: Union[SynthesisRequest, SoundEffectRequest], key: Optional[str] = None
+               ) -> tuple[Job, bool]:
+        """Queue a request; returns (job, created). A known `key` returns its existing job of the same
+        kind, so a client that lost the response to a submission can retry it without generating twice."""
         # Speech only: [pause] markers become silence without any generation work.
-        job = Job(request=req, key=key, est_seconds=estimate_seconds(PAUSE_RE.sub(" ", req.text)))
+        est = estimate_seconds(PAUSE_RE.sub(" ", req.text)) if req.kind == "tts" else 0.0
+        job = Job(request=req, key=key, est_seconds=est)
         with self.cond:
-            if key is not None and key in self.keys:
-                return self.keys[key], False
+            if key is not None and (req.kind, key) in self.keys:
+                return self.keys[(req.kind, key)], False
             if len(self.pending) >= self.cfg.queue_max:
                 raise TTSError("queue_full", f"Queue is full ({self.cfg.queue_max} waiting); retry later.", 503,
                                queue_length=len(self.pending))
@@ -105,10 +122,14 @@ class Scheduler:
             self.pending.append(job)
             self.jobs[job.id] = job
             if key is not None:
-                self.keys[key] = job
+                self.keys[(req.kind, key)] = job
             self.cond.notify_all()
             queued = len(self.pending)
-        log.info("job %s queued (model=%s, %d chars, queue=%d)", job.id, req.model.id, len(req.text), queued)
+        if req.kind == "sfx":
+            log.info("job %s queued (model=%s, %d effect(s), %.1fs, queue=%d)", job.id, req.model.id,
+                     len(req.clips), req.total_seconds, queued)
+        else:
+            log.info("job %s queued (model=%s, %d chars, queue=%d)", job.id, req.model.id, len(req.text), queued)
         return job, True
 
     def get(self, job_id: str) -> Job:
@@ -173,12 +194,17 @@ class Scheduler:
             out = []
             for job in sorted(self.jobs.values(), key=lambda j: j.created, reverse=True):
                 text = job.request.text
-                d = {"id": job.id, "status": job.status, "model": job.request.model.id,
+                d = {"id": job.id, "kind": job.request.kind, "status": job.status, "model": job.request.model.id,
                      "voice": job.request.voice.name if job.request.voice else None,
                      "format": job.request.response_format, "created": job.created, "finished": job.finished,
                      "chars": len(text), "text": text if len(text) <= 80 else text[:79] + "…",
                      "progress": {"segments_done": job.segments_done, "segments_total": job.segments_total}}
-                if job.request.clips is not None:
+                if job.request.kind == "sfx":
+                    d["seconds"] = round(job.request.total_seconds, 3)
+                    d["progress"] = {"clips_done": job.segments_done, "clips_total": job.segments_total}
+                    if not job.request.single:
+                        d["clips"] = len(job.request.clips)
+                elif job.request.clips is not None:
                     d["clips"] = len(job.request.clips)
                 if job.error is not None:
                     d["error_code"] = job.error.get("code")
@@ -188,15 +214,22 @@ class Scheduler:
     def _model_loaded(self, model_id: str) -> bool:
         return self.manager.loaded_model == model_id
 
+    def _load_estimate(self, model: str) -> float:
+        prior = DEFAULT_SFX_LOAD_SECONDS if self.manager.adapter(model).kind == "sfx" else DEFAULT_LOAD_SECONDS
+        return self.load_seconds.get(model, prior)
+
     def _remaining(self, job: Job, loaded_model: Optional[str]) -> float:
         """Estimated seconds of work left in one job (caller holds the lock)."""
         model = job.request.model.id
-        work = job.est_seconds * self.rtf.get(model, DEFAULT_RTF)
-        if job.status == "running":
-            if job.segments_total:
+        if job.request.kind == "sfx":  # per clip, whatever its length
+            left = len(job.request.clips) - (job.segments_done if job.status == "running" else 0)
+            work = left * self.clip_seconds.get(model, DEFAULT_SFX_CLIP_SECONDS)
+        else:
+            work = job.est_seconds * self.rtf.get(model, DEFAULT_RTF)
+            if job.status == "running" and job.segments_total:
                 work *= 1 - job.segments_done / job.segments_total
-            if loaded_model != model:  # still loading
-                work += self.load_seconds.get(model, DEFAULT_LOAD_SECONDS)
+        if job.status == "running" and loaded_model != model:  # still loading
+            work += self._load_estimate(model)
         return work
 
     def _estimate(self, job: Job) -> Optional[float]:
@@ -212,7 +245,7 @@ class Scheduler:
                 loaded = self.running.request.model.id
             for j in self.pending:
                 if j.request.model.id != loaded:
-                    total += self.load_seconds.get(j.request.model.id, DEFAULT_LOAD_SECONDS)
+                    total += self._load_estimate(j.request.model.id)
                     loaded = j.request.model.id
                 total += self._remaining(j, loaded)
                 if j is job:
@@ -222,25 +255,42 @@ class Scheduler:
         return round(total, 1)
 
     def estimates(self) -> dict[str, Any]:
+        """Per model: speech models give seconds of synthesis per second of speech (rtf), sound-effect
+        models seconds per clip; both give the load time (for sound effects, including compilation)."""
         with self.cond:
-            return {m: {"rtf": round(self.rtf.get(m, DEFAULT_RTF), 3), "rtf_measured": m in self.rtf,
-                        "load_seconds": round(self.load_seconds.get(m, DEFAULT_LOAD_SECONDS), 1),
-                        "load_measured": m in self.load_seconds}
-                    for m in self.manager.adapters}
+            out = {}
+            for m, a in self.manager.adapters.items():
+                load = {"load_seconds": round(self._load_estimate(m), 1), "load_measured": m in self.load_seconds}
+                if a.kind == "sfx":
+                    out[m] = {"kind": "sfx", "clip_seconds": round(self.clip_seconds.get(m, DEFAULT_SFX_CLIP_SECONDS), 1),
+                              "clip_measured": m in self.clip_seconds, **load}
+                else:
+                    out[m] = {"rtf": round(self.rtf.get(m, DEFAULT_RTF), 3), "rtf_measured": m in self.rtf, **load}
+            return out
 
     def snapshot(self, job: Job) -> dict[str, Any]:
         """Consistent view of a job (taken under the scheduler lock)."""
         with self.cond:
-            d = {
-                "id": job.id, "status": job.status, "model": job.request.model.id,
-                "voice": job.request.voice.name if job.request.voice else None,
-                "format": job.request.response_format,
-                "created": job.created, "started": job.started, "finished": job.finished,
-                "progress": {"segments_done": job.segments_done, "segments_total": job.segments_total},
-                "estimated_remaining_seconds": self._estimate(job),
-            }
-            if job.request.clips is not None:
-                d["clips_total"] = len(job.request.clips)
+            req = job.request
+            if req.kind == "sfx":
+                d = {"id": job.id, "kind": "sfx", "status": job.status, "model": req.model.id,
+                     "format": req.response_format, "created": job.created, "started": job.started,
+                     "finished": job.finished,
+                     "progress": {"clips_done": job.segments_done, "clips_total": job.segments_total},
+                     "estimated_remaining_seconds": self._estimate(job)}
+                if not req.single:
+                    d["clips_total"] = len(req.clips)
+            else:
+                d = {
+                    "id": job.id, "kind": "tts", "status": job.status, "model": req.model.id,
+                    "voice": req.voice.name if req.voice else None,
+                    "format": req.response_format,
+                    "created": job.created, "started": job.started, "finished": job.finished,
+                    "progress": {"segments_done": job.segments_done, "segments_total": job.segments_total},
+                    "estimated_remaining_seconds": self._estimate(job),
+                }
+                if req.clips is not None:
+                    d["clips_total"] = len(req.clips)
             if job.cancel_requested:
                 d["cancel_requested"] = True
             if job.status == "queued":
@@ -273,7 +323,7 @@ class Scheduler:
         for jid in [j.id for j in self.jobs.values() if j.finished and j.finished < cutoff]:
             job = self.jobs.pop(jid)
             if job.key is not None:
-                self.keys.pop(job.key, None)
+                self.keys.pop((job.request.kind, job.key), None)
 
     @staticmethod
     def _observe(table: dict[str, float], model: str, value: float) -> None:
@@ -291,10 +341,14 @@ class Scheduler:
                 if not self.pending:
                     # Nothing running (single worker) and the queue is empty; submit() is blocked on
                     # the lock while we decide and unload.
-                    if (self.manager.loaded_model
+                    if (self.manager.current is not None
                             and time.monotonic() - self.last_activity >= self.cfg.idle_unload_seconds):
                         log.info("idle for %.0fs; unloading", time.monotonic() - self.last_activity)
-                        self.manager.unload()
+                        try:
+                            self.manager.unload()
+                        except TTSError as e:  # retried after another idle period
+                            log.error("idle unload failed: %s", e.message)
+                            self.last_activity = time.monotonic()
                     continue
                 job = self.pending.popleft()
                 job.status, job.started = "running", time.time()
@@ -305,7 +359,10 @@ class Scheduler:
             with self.cond:
                 idle = not self.pending
             if idle:  # a request arriving now waits only for this (milliseconds)
-                self.manager.release_cache()
+                try:  # maintenance only: whatever it raises must not end the GPU worker thread
+                    self.manager.release_cache()
+                except Exception:  # noqa: BLE001
+                    log.exception("releasing cached GPU memory failed")
 
     def _run(self, job: Job) -> None:
         req = job.request
@@ -328,46 +385,10 @@ class Scheduler:
                 with self.cond:
                     self._observe(self.load_seconds, req.model.id, self.manager.last_load_seconds)
 
-            t = time.perf_counter()
-            res = synthesize(adapter, req, self.cfg.segmenting, progress, cancelled=lambda: job.cancel_requested)
-            elapsed = time.perf_counter() - t
-            if warm and job.est_seconds >= 1.0:
-                with self.cond:
-                    self._observe(self.rtf, req.model.id, elapsed / job.est_seconds)
-            if res.clips is not None:
-                clip_audio, clips, duration = {}, [], 0.0
-                for c in res.clips:
-                    info: dict[str, Any] = {"id": c.id, "segments": c.segments}
-                    if c.error is not None:
-                        clips.append(info | {"status": "failed", "error": c.error})
-                        continue
-                    data = encode(c.audio, res.sample_rate, req.response_format)
-                    clip_audio[c.id] = data
-                    seconds = c.audio.shape[1] / res.sample_rate
-                    duration += seconds
-                    clips.append(info | {"status": "succeeded", "duration": round(seconds, 3), "bytes": len(data),
-                                         "sha256": hashlib.sha256(data).hexdigest(), "warnings": c.warnings,
-                                         "timeline": c.timeline})
-                size = sum(map(len, clip_audio.values()))
+            if req.kind == "sfx":
+                audio, clip_audio, size, meta = self._effects(job, adapter, progress, warm)
             else:
-                audio = encode(res.audio, res.sample_rate, req.response_format)
-                size, duration = len(audio), res.duration
-            meta = {
-                "duration": round(duration, 3), "sample_rate": res.sample_rate,
-                "channels": int(res.audio.shape[0]), "format": req.response_format,
-                "content_type": FORMATS[req.response_format], "bytes": size,
-                "model": req.model.id, "voice": req.voice.name if req.voice else None,
-                "language": req.language, "segments": res.segments, "retries": res.retries,
-                "splits": res.splits, "batch_size": res.batch_size, "synthesis_seconds": round(elapsed, 2),
-                "rtf": round(elapsed / duration, 3) if duration else None,
-                "warnings": res.warnings,
-            }
-            if res.clips is not None:
-                meta["clips"] = clips
-            else:
-                meta["timeline"] = res.timeline
-            log.info("job %s done: %.1fs audio in %.1fs (%d segments, %d retries, %d splits)",
-                     job.id, duration, elapsed, res.segments, res.retries, res.splits)
+                audio, clip_audio, size, meta = self._speech(job, adapter, progress, warm)
         except TTSError as e:
             error = TTSError(e.code, e.message, e.http_status, **e.details)
             log.warning("job %s failed: %s %s", job.id, e.code, e.message)
@@ -375,12 +396,13 @@ class Scheduler:
             log.exception("job %s crashed", job.id)
             seg, clip = getattr(e, "tts_segment", None), getattr(e, "tts_clip", None)
             where = ({} if seg is None else {"segment": seg}) | ({} if clip is None else {"clip": clip})
-            at = "" if seg is None else (f" (segment {seg})" if clip is None else f" (clip '{clip}' segment {seg})")
+            at = (f" (clip '{clip}')" if clip is not None else "") if seg is None else (
+                f" (segment {seg})" if clip is None else f" (clip '{clip}' segment {seg})")
             if type(e).__name__ == "OutOfMemoryError":
                 error = TTSError("gpu_out_of_memory", f"GPU out of memory{at}: {e}", 500, **where)
             else:
                 error = TTSError("internal_error", f"{type(e).__name__}{at}: {e}", 500, **where)
-        if error is not None and error.code == "gpu_out_of_memory":
+        if error is not None and error.code == "gpu_out_of_memory" and req.kind == "tts":  # sfx: another process
             import torch
             torch.cuda.empty_cache()
         with self.cond:
@@ -395,3 +417,96 @@ class Scheduler:
                 job.error, job.error_http_status, job.status = error.to_dict(), error.http_status, "failed"
             self.running = None
         job.done.set()
+
+    def _speech(self, job: Job, adapter, progress, warm: bool):
+        req = job.request
+        audio: Optional[bytes] = None
+        clip_audio: Optional[dict[str, bytes]] = None
+        t = time.perf_counter()
+        res = synthesize(adapter, req, self.cfg.segmenting, progress, cancelled=lambda: job.cancel_requested)
+        elapsed = time.perf_counter() - t
+        if warm and job.est_seconds >= 1.0:
+            with self.cond:
+                self._observe(self.rtf, req.model.id, elapsed / job.est_seconds)
+        if res.clips is not None:
+            clip_audio, clips, duration = {}, [], 0.0
+            for c in res.clips:
+                info: dict[str, Any] = {"id": c.id, "segments": c.segments}
+                if c.error is not None:
+                    clips.append(info | {"status": "failed", "error": c.error})
+                    continue
+                data = encode(c.audio, res.sample_rate, req.response_format)
+                clip_audio[c.id] = data
+                seconds = c.audio.shape[1] / res.sample_rate
+                duration += seconds
+                clips.append(info | {"status": "succeeded", "duration": round(seconds, 3), "bytes": len(data),
+                                     "sha256": hashlib.sha256(data).hexdigest(), "warnings": c.warnings,
+                                     "timeline": c.timeline})
+            size = sum(map(len, clip_audio.values()))
+        else:
+            audio = encode(res.audio, res.sample_rate, req.response_format)
+            size, duration = len(audio), res.duration
+        meta = {
+            "duration": round(duration, 3), "sample_rate": res.sample_rate,
+            "channels": int(res.audio.shape[0]), "format": req.response_format,
+            "content_type": FORMATS[req.response_format], "bytes": size,
+            "model": req.model.id, "voice": req.voice.name if req.voice else None,
+            "language": req.language, "segments": res.segments, "retries": res.retries,
+            "splits": res.splits, "batch_size": res.batch_size, "synthesis_seconds": round(elapsed, 2),
+            "rtf": round(elapsed / duration, 3) if duration else None,
+            "warnings": res.warnings,
+        }
+        if res.clips is not None:
+            meta["clips"] = clips
+        else:
+            meta["timeline"] = res.timeline
+        log.info("job %s done: %.1fs audio in %.1fs (%d segments, %d retries, %d splits)",
+                 job.id, duration, elapsed, res.segments, res.retries, res.splits)
+        return audio, clip_audio, size, meta
+
+    def _effects(self, job: Job, adapter, progress, warm: bool):
+        """A sound-effect job: one generation per clip; a clip error fails only that clip."""
+        req = job.request
+        measured = [warm]  # the first clip after a load may still compile or record graphs: not measured
+
+        def clip_time(seconds: float) -> None:
+            if measured[0]:
+                with self.cond:
+                    self._observe(self.clip_seconds, req.model.id, seconds)
+            measured[0] = True
+
+        t = time.perf_counter()
+        res = generate_effects(adapter, req, progress, cancelled=lambda: job.cancel_requested, clip_time=clip_time)
+        elapsed = time.perf_counter() - t
+        audio: Optional[bytes] = None
+        clip_audio: Optional[dict[str, bytes]] = None
+        clips, duration, size = [], 0.0, 0
+        for c in res.clips:
+            info: dict[str, Any] = {"id": c.id, "seconds_requested": c.seconds, "seed": c.seed}
+            if c.error is not None:
+                clips.append(info | {"status": "failed", "error": c.error})
+                continue
+            data = encode(c.audio, res.sample_rate, req.response_format)
+            seconds = c.audio.shape[1] / res.sample_rate
+            duration += seconds
+            size += len(data)
+            if req.single:
+                audio = data
+            else:
+                clip_audio = (clip_audio or {}) | {c.id: data}
+            clips.append(info | {"status": "succeeded", "duration": round(seconds, 3), "bytes": len(data),
+                                 "sha256": hashlib.sha256(data).hexdigest(),
+                                 "generation_seconds": round(c.generation_seconds, 2)})
+        meta = {
+            "kind": "sfx", "duration": round(duration, 3), "sample_rate": res.sample_rate,
+            "channels": res.channels, "format": req.response_format,
+            "content_type": FORMATS[req.response_format], "bytes": size, "model": req.model.id,
+            "synthesis_seconds": round(elapsed, 2), "warnings": res.warnings,
+        }
+        if req.single:
+            meta |= {k: clips[0][k] for k in ("seconds_requested", "seed", "generation_seconds")}
+        else:
+            meta["clips"] = clips
+        log.info("job %s done: %d/%d effect(s), %.1fs audio in %.1fs", job.id,
+                 sum(c["status"] == "succeeded" for c in clips), len(clips), duration, elapsed)
+        return audio, clip_audio, size, meta

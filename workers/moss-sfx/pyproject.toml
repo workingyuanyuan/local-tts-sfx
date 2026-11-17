@@ -1,0 +1,32 @@
+# Isolated environment for the MOSS-SoundEffect v2.0 worker subprocess. The model hard-pins numpy 1.26.4
+# and transformers 4.57.1, which conflict with the service's environment, so it gets its own venv:
+#   uv sync --frozen --project workers/moss-sfx
+# The service starts worker.py with workers/moss-sfx/.venv/bin/python; the worker never imports local_tts.
+[project]
+name = "local-tts-moss-sfx-worker"
+version = "0.1.0"
+description = "MOSS-SoundEffect v2.0 worker for local-tts (separate environment)"
+requires-python = "==3.12.*"
+dependencies = [
+  "moss-soundeffect-v2[torch-cu128]",
+  # Pinned by moss-soundeffect-v2[torch-cu128]; listed here so uv.sources can route them to the CUDA index.
+  "torch==2.9.0+cu128",
+  "torchaudio==2.9.0+cu128",
+  "torchvision==0.24.0+cu128",
+  "huggingface-hub",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+moss-soundeffect-v2 = { path = "../../third_party/MOSS-TTS/moss_soundeffect_v2", editable = true }
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

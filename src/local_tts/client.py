@@ -15,6 +15,7 @@ before its own timeout.
 """
 import asyncio
 import hashlib
+import math
 import os
 import re
 import subprocess
@@ -51,6 +52,17 @@ MAX_VOICE_UPLOAD = 16 * 2**20
 CLIP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 EXISTS_HINT = "set overwrite (MCP: overwrite=true, CLI: --overwrite) to replace it"
+
+# The MCP tools that submit / fetch each kind of job: (kind, clips) -> (generate tool, get tool).
+MCP_TOOLS = {("tts", False): ("generate_speech", "get_speech_job"),
+             ("tts", True): ("generate_speech_clips", "get_speech_clips"),
+             ("sfx", False): ("generate_sound_effect", "get_sound_effect_job"),
+             ("sfx", True): ("generate_sound_effect_clips", "get_sound_effect_clips")}
+
+
+def job_kind(job: dict) -> str:
+    """"tts" (speech) or "sfx" (sound effects) for a job snapshot or result."""
+    return job.get("kind") or (job.get("result") or {}).get("kind") or "tts"
 
 
 class ClientError(Exception):
@@ -288,12 +300,26 @@ class TTSClient:
         body = {"input": text, "model": model, "voice": voice, "language": language,
                 "response_format": fmt, "seed": seed,
                 "clips": None if clips is None else [{"id": i, "input": t} for i, t in clips]}
+        return await self._post_job("/v1/jobs", body, deadline)
+
+    async def submit_sfx(self, prompt: Optional[str], *, seconds: Optional[float] = None,
+                         clips: Optional[list[dict[str, Any]]] = None, model=None, fmt="wav", seed=None,
+                         num_inference_steps=None, cfg_scale=None, deadline: Optional[Deadline] = None) -> dict:
+        """Create a sound-effect job: one `prompt` of `seconds`, or `clips` [{id, prompt, seconds?, seed?}]
+        (a clip without seconds uses `seconds`). Same Idempotency-Key retry as submit()."""
+        body = {"prompt": prompt, "seconds": seconds, "model": model, "response_format": fmt, "seed": seed,
+                "num_inference_steps": num_inference_steps, "cfg_scale": cfg_scale,
+                "clips": None if clips is None else [{k: v for k, v in c.items() if v is not None} for c in clips]}
+        return await self._post_job("/v1/sfx/jobs", body, deadline)
+
+    async def _post_job(self, path: str, body: dict, deadline: Optional[Deadline]) -> dict:
+        _require_finite(body)  # NaN/Infinity cannot be sent as JSON: a clear error instead of a crash
         kw = {"json": {k: v for k, v in body.items() if v is not None},
               "headers": {"Idempotency-Key": uuid.uuid4().hex}}
         deadline = deadline or Deadline(None)
         for attempt in range(SUBMIT_ATTEMPTS):
             try:
-                return (await self._request("POST", "/v1/jobs", timeout=deadline.request_timeout(POLL_TIMEOUT),
+                return (await self._request("POST", path, timeout=deadline.request_timeout(POLL_TIMEOUT),
                                             **kw)).json()
             except ClientError as e:
                 left = deadline.remaining()
@@ -376,9 +402,10 @@ class TTSClient:
         "timeline" included; callers drop it unless asked, as it repeats the whole input text)."""
         raise_job_error(job)
         r = job["result"]
+        kind = job_kind(job)
         if "clips" in r:
-            raise ClientError("clips_job", f"Job {job['id']} is a clips job: fetch it with get_speech_clips "
-                              "(CLI: tts job <id> -d <dir>).", job_id=job["id"])
+            raise ClientError("clips_job", f"Job {job['id']} is a clips job: fetch it with {MCP_TOOLS[kind, True][1]} "
+                              "(CLI: tts job <id> -d <dir>).", job_id=job["id"], job_kind=kind)
         if path.suffix.lower().lstrip(".") != r["format"]:
             raise ClientError("format_mismatch", f"Job audio is {r['format']} but the output path is '{path}'.",
                               job_id=job["id"])
@@ -387,9 +414,13 @@ class TTSClient:
         # thread after the caller released its lock (writing a few MB locally takes milliseconds).
         write_file(path, data, overwrite)
         out = {"status": "completed", "path": str(path), "duration_seconds": r["duration"],
-                "sample_rate": r["sample_rate"], "channels": r["channels"], "format": r["format"],
-                "model": r["model"], "voice": r["voice"], "language": r["language"],
-                "segments": r["segments"], "job_id": job["id"]}
+               "sample_rate": r["sample_rate"], "channels": r["channels"], "format": r["format"],
+               "model": r["model"]}
+        if kind == "sfx":
+            out |= {"kind": "sfx", "seconds_requested": r["seconds_requested"], "seed": r["seed"]}
+        else:
+            out |= {"voice": r["voice"], "language": r["language"], "segments": r["segments"]}
+        out["job_id"] = job["id"]
         if r.get("warnings"):  # e.g. a segment that stayed suspiciously short (a sentence may be missing)
             out["warnings"] = r["warnings"]
         if r.get("timeline") is not None:
@@ -405,9 +436,11 @@ class TTSClient:
         repeated calls only fetch what is missing. All downloads of one call share DOWNLOAD_TIMEOUT."""
         raise_job_error(job)
         r = job["result"]
+        kind = job_kind(job)
         if "clips" not in r:
-            raise ClientError("not_a_clips_job", f"Job {job['id']} has one audio: fetch it with get_speech_job "
-                              "(CLI: tts job <id> -o <file>).", job_id=job["id"])
+            raise ClientError("not_a_clips_job", f"Job {job['id']} has one audio: fetch it with "
+                              f"{MCP_TOOLS[kind, False][1]} (CLI: tts job <id> -o <file>).", job_id=job["id"],
+                              job_kind=kind)
         fmt = r["format"]
         budget = Deadline(DOWNLOAD_TIMEOUT)
         clips = []
@@ -427,18 +460,39 @@ class TTSClient:
             except (ClientError, OSError) as e:
                 clips.append(item | {"status": "failed", "stage": "delivery", "error": as_client_error(e).to_dict()})
                 continue
-            done = item | {"status": "completed", "duration_seconds": c["duration"], "segments": c["segments"]}
+            done = item | {"status": "completed", "duration_seconds": c["duration"]}
+            if kind == "sfx":
+                done |= {"seconds_requested": c["seconds_requested"], "seed": c["seed"]}
+            else:
+                done["segments"] = c["segments"]
             if c.get("warnings"):
                 done["warnings"] = c["warnings"]
-            done["timeline"] = c.get("timeline", [])
+            if kind != "sfx":
+                done["timeline"] = c.get("timeline", [])
             clips.append(done)
         out = {"status": "completed" if all(c["status"] == "completed" for c in clips) else "partial",
-               "job_id": job["id"], "output_dir": str(directory), "format": fmt, "model": r["model"],
-               "voice": r["voice"], "language": r["language"], "sample_rate": r["sample_rate"],
-               "channels": r["channels"], "clips": clips}
+               "job_id": job["id"], "output_dir": str(directory), "format": fmt, "model": r["model"]}
+        if kind == "sfx":
+            out["kind"] = "sfx"
+        else:
+            out |= {"voice": r["voice"], "language": r["language"]}
+        out |= {"sample_rate": r["sample_rate"], "channels": r["channels"], "clips": clips}
         if r.get("warnings"):
             out["warnings"] = r["warnings"]
         return out
+
+
+def _require_finite(value: Any, where: str = "") -> None:
+    """Raise invalid_request for a NaN or infinite number anywhere in a request body."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ClientError("invalid_request", f"{where or 'value'} must be a finite number, got {value}.",
+                          parameter=where)
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _require_finite(v, f"{where}.{k}" if where else str(k))
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            _require_finite(v, f"{where}[{i}]")
 
 
 def _same_file(path: Path, sha256: Optional[str]) -> bool:
