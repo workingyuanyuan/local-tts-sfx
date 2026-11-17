@@ -14,6 +14,7 @@ by all requests of one call, so a caller (e.g. an MCP tool call) gets an answer 
 before its own timeout.
 """
 import asyncio
+import hashlib
 import os
 import re
 import subprocess
@@ -46,6 +47,8 @@ SUBMIT_ATTEMPTS = 3
 LONG_POLL = 20.0
 # Largest reference recording register_voice uploads (the server's limit).
 MAX_VOICE_UPLOAD = 16 * 2**20
+# Clip ids name the files of a clips job (<output_dir>/<id>.<format>); the server checks the same rule.
+CLIP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 EXISTS_HINT = "set overwrite (MCP: overwrite=true, CLI: --overwrite) to replace it"
 
@@ -152,6 +155,36 @@ def resolve_output_path(path: Optional[str], fmt: Optional[str]) -> tuple[Path, 
     return p, fmt
 
 
+def resolve_output_dir(path: Optional[str]) -> Path:
+    """The directory a clips job writes into (absolute; default: a new folder in the output dir)."""
+    if not path:
+        if not OUTPUT_DIR.is_absolute():
+            raise ClientError("invalid_path", f"LOCAL_TTS_OUTPUT_DIR must be absolute, got '{OUTPUT_DIR}'.")
+        return OUTPUT_DIR / ("clips-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3])
+    if WINDOWS_PATH_RE.match(path):
+        path = _from_windows(path)
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise ClientError("invalid_path", f"output_dir must be absolute, got '{path}'.")
+    if p.exists() and not p.is_dir():
+        raise ClientError("invalid_path", f"output_dir '{p}' is a file, not a directory.")
+    return p
+
+
+def clip_paths(directory: Path, ids: list[str], fmt: str) -> dict[str, Path]:
+    """<directory>/<id>.<fmt> for each clip id; ids must be valid file names and unique."""
+    if fmt not in FORMATS:
+        raise ClientError("unsupported_format", f"Unsupported format '{fmt}'.", available=list(FORMATS))
+    bad = [i for i in ids if not CLIP_ID_RE.fullmatch(i)]
+    if bad:
+        raise ClientError("invalid_clip_id", "Clip ids are 1-64 characters: letters, digits, '_', '-' or '.', "
+                          "starting with a letter or digit (they name the output files).", ids=bad)
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    if dup:
+        raise ClientError("invalid_clip_id", f"Duplicate clip id(s): {', '.join(dup)}.", ids=dup)
+    return {i: directory / f"{i}.{fmt}" for i in ids}
+
+
 def check_target(path: Path, overwrite: bool) -> None:
     if path.is_dir():
         raise ClientError("invalid_path", f"'{path}' is a directory.")
@@ -247,12 +280,14 @@ class TTSClient:
     async def voices(self, model: Optional[str] = None) -> list[dict]:
         return (await self._request("GET", "/v1/voices", params={"model": model} if model else None)).json()["data"]
 
-    async def submit(self, text: str, *, model=None, voice=None, language=None, fmt="wav", seed=None,
-                     deadline: Optional[Deadline] = None) -> dict:
-        """Create a job. The request carries an Idempotency-Key, so when the response is lost (the
-        server may have accepted the job) retrying returns that same job instead of generating twice."""
+    async def submit(self, text: Optional[str], *, model=None, voice=None, language=None, fmt="wav", seed=None,
+                     deadline: Optional[Deadline] = None, clips: Optional[list[tuple[str, str]]] = None) -> dict:
+        """Create a job (from `text`, or `clips` of (id, text)). The request carries an Idempotency-Key, so
+        when the response is lost (the server may have accepted the job) retrying returns that same job
+        instead of generating twice."""
         body = {"input": text, "model": model, "voice": voice, "language": language,
-                "response_format": fmt, "seed": seed}
+                "response_format": fmt, "seed": seed,
+                "clips": None if clips is None else [{"id": i, "input": t} for i, t in clips]}
         kw = {"json": {k: v for k, v in body.items() if v is not None},
               "headers": {"Idempotency-Key": uuid.uuid4().hex}}
         deadline = deadline or Deadline(None)
@@ -341,6 +376,9 @@ class TTSClient:
         "timeline" included; callers drop it unless asked, as it repeats the whole input text)."""
         raise_job_error(job)
         r = job["result"]
+        if "clips" in r:
+            raise ClientError("clips_job", f"Job {job['id']} is a clips job: fetch it with get_speech_clips "
+                              "(CLI: tts job <id> -d <dir>).", job_id=job["id"])
         if path.suffix.lower().lstrip(".") != r["format"]:
             raise ClientError("format_mismatch", f"Job audio is {r['format']} but the output path is '{path}'.",
                               job_id=job["id"])
@@ -359,6 +397,66 @@ class TTSClient:
         return out
 
 
+    async def save_clips(self, job: dict, directory: Path, overwrite: bool) -> dict:
+        """Download and write each succeeded clip of a finished clips job to <directory>/<id>.<format>.
+        A clip that cannot be written does not stop the others; its entry says why. A target that
+        already holds exactly the clip's audio (same sha256,
+        written by an earlier call or process) counts as written without downloading it again, so
+        repeated calls only fetch what is missing. All downloads of one call share DOWNLOAD_TIMEOUT."""
+        raise_job_error(job)
+        r = job["result"]
+        if "clips" not in r:
+            raise ClientError("not_a_clips_job", f"Job {job['id']} has one audio: fetch it with get_speech_job "
+                              "(CLI: tts job <id> -o <file>).", job_id=job["id"])
+        fmt = r["format"]
+        budget = Deadline(DOWNLOAD_TIMEOUT)
+        clips = []
+        for c in r["clips"]:
+            path = directory / f"{c['id']}.{fmt}"
+            item: dict[str, Any] = {"id": c["id"], "path": str(path)}
+            if c["status"] != "succeeded":
+                clips.append(item | {"status": "failed", "stage": "synthesis", "error": c["error"]})
+                continue
+            try:
+                if not _same_file(path, c.get("sha256")):
+                    if budget.expired():
+                        raise ClientError("download_incomplete", "Out of time for downloads in this call; call again.")
+                    data = (await self._request("GET", f"/v1/jobs/{job['id']}/audio", params={"clip": c["id"]},
+                                                timeout=budget.request_timeout(DOWNLOAD_TIMEOUT))).content
+                    write_file(path, data, overwrite)
+            except (ClientError, OSError) as e:
+                clips.append(item | {"status": "failed", "stage": "delivery", "error": as_client_error(e).to_dict()})
+                continue
+            done = item | {"status": "completed", "duration_seconds": c["duration"], "segments": c["segments"]}
+            if c.get("warnings"):
+                done["warnings"] = c["warnings"]
+            done["timeline"] = c.get("timeline", [])
+            clips.append(done)
+        out = {"status": "completed" if all(c["status"] == "completed" for c in clips) else "partial",
+               "job_id": job["id"], "output_dir": str(directory), "format": fmt, "model": r["model"],
+               "voice": r["voice"], "language": r["language"], "sample_rate": r["sample_rate"],
+               "channels": r["channels"], "clips": clips}
+        if r.get("warnings"):
+            out["warnings"] = r["warnings"]
+        return out
+
+
+def _same_file(path: Path, sha256: Optional[str]) -> bool:
+    """Does `path` already hold exactly this audio?"""
+    if not sha256 or not path.is_file():
+        return False
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest() == sha256
+
+
 def with_timeline(result: dict[str, Any], timeline: bool) -> dict[str, Any]:
-    """A completed result with or without its per-segment timeline."""
-    return result if timeline else {k: v for k, v in result.items() if k != "timeline"}
+    """A completed result with or without its per-segment timeline (per clip for a clips job)."""
+    if timeline:
+        return result
+    out = {k: v for k, v in result.items() if k != "timeline"}
+    if "clips" in out:
+        out["clips"] = [{k: v for k, v in c.items() if k != "timeline"} for c in out["clips"]]
+    return out

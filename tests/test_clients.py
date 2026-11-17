@@ -120,7 +120,8 @@ def test_mcp_tools_listed():
             return [t.name for t in (await c.list_tools()).tools]
     assert set(asyncio.run(go())) == {"generate_speech", "get_speech_job", "cancel_speech_job",
                                        "list_models", "list_voices", "tts_status", "list_speech_jobs",
-                                       "unload_model", "register_voice"}
+                                       "unload_model", "register_voice", "generate_speech_clips",
+                                       "get_speech_clips"}
 
 
 def test_mcp_generate_completed(tts, tmp_path):

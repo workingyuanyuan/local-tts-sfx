@@ -7,6 +7,7 @@ One condition variable guards the pending queue and every job-state transition, 
   waits for the unload to finish instead of racing it.
 """
 import collections
+import hashlib
 import logging
 import threading
 import time
@@ -41,6 +42,7 @@ class Job:
     segments_done: int = 0
     segments_total: Optional[int] = None
     audio: Optional[bytes] = None
+    clip_audio: Optional[dict[str, bytes]] = None  # a clips job: encoded audio of each succeeded clip
     meta: dict[str, Any] = field(default_factory=dict)
     # Stored as plain data (not the exception) so no traceback keeps GPU objects alive.
     error: Optional[dict[str, Any]] = None
@@ -176,6 +178,8 @@ class Scheduler:
                      "format": job.request.response_format, "created": job.created, "finished": job.finished,
                      "chars": len(text), "text": text if len(text) <= 80 else text[:79] + "…",
                      "progress": {"segments_done": job.segments_done, "segments_total": job.segments_total}}
+                if job.request.clips is not None:
+                    d["clips"] = len(job.request.clips)
                 if job.error is not None:
                     d["error_code"] = job.error.get("code")
                 out.append(d)
@@ -235,6 +239,8 @@ class Scheduler:
                 "progress": {"segments_done": job.segments_done, "segments_total": job.segments_total},
                 "estimated_remaining_seconds": self._estimate(job),
             }
+            if job.request.clips is not None:
+                d["clips_total"] = len(job.request.clips)
             if job.cancel_requested:
                 d["cancel_requested"] = True
             if job.status == "queued":
@@ -245,10 +251,12 @@ class Scheduler:
                 d["error"] = dict(job.error)
             return d
 
-    def outcome(self, job: Job) -> tuple[str, Optional[dict[str, Any]], int, Optional[bytes], dict[str, Any]]:
-        """(status, error, error_http_status, audio, meta) read atomically."""
+    def outcome(self, job: Job, clip: Optional[str] = None
+                ) -> tuple[str, Optional[dict[str, Any]], int, Optional[bytes], dict[str, Any]]:
+        """(status, error, error_http_status, audio, meta) read atomically; `clip` picks one clip's audio."""
         with self.cond:
-            return job.status, job.error, job.error_http_status, job.audio, dict(job.meta)
+            audio = job.audio if clip is None else (job.clip_audio or {}).get(clip)
+            return job.status, job.error, job.error_http_status, audio, dict(job.meta)
 
     def stats(self) -> dict[str, Any]:
         with self.cond:
@@ -257,7 +265,7 @@ class Scheduler:
 
     def _held_bytes(self) -> int:
         """RAM used by finished audio waiting to be fetched. Caller holds the lock."""
-        return sum(len(j.audio) for j in self.jobs.values() if j.audio is not None)
+        return sum(len(j.audio or b"") + sum(map(len, (j.clip_audio or {}).values())) for j in self.jobs.values())
 
     def _purge(self) -> None:
         """Drop finished jobs (and their audio) older than the TTL. Caller holds the lock."""
@@ -303,6 +311,8 @@ class Scheduler:
         req = job.request
         meta: dict[str, Any] = {}
         audio: Optional[bytes] = None
+        clip_audio: Optional[dict[str, bytes]] = None
+        size = 0
         error: Optional[TTSError] = None
         try:
             adapter = self.manager.acquire(req.model.id)
@@ -324,27 +334,48 @@ class Scheduler:
             if warm and job.est_seconds >= 1.0:
                 with self.cond:
                     self._observe(self.rtf, req.model.id, elapsed / job.est_seconds)
-            audio = encode(res.audio, res.sample_rate, req.response_format)
+            if res.clips is not None:
+                clip_audio, clips, duration = {}, [], 0.0
+                for c in res.clips:
+                    info: dict[str, Any] = {"id": c.id, "segments": c.segments}
+                    if c.error is not None:
+                        clips.append(info | {"status": "failed", "error": c.error})
+                        continue
+                    data = encode(c.audio, res.sample_rate, req.response_format)
+                    clip_audio[c.id] = data
+                    seconds = c.audio.shape[1] / res.sample_rate
+                    duration += seconds
+                    clips.append(info | {"status": "succeeded", "duration": round(seconds, 3), "bytes": len(data),
+                                         "sha256": hashlib.sha256(data).hexdigest(), "warnings": c.warnings,
+                                         "timeline": c.timeline})
+                size = sum(map(len, clip_audio.values()))
+            else:
+                audio = encode(res.audio, res.sample_rate, req.response_format)
+                size, duration = len(audio), res.duration
             meta = {
-                "duration": round(res.duration, 3), "sample_rate": res.sample_rate,
+                "duration": round(duration, 3), "sample_rate": res.sample_rate,
                 "channels": int(res.audio.shape[0]), "format": req.response_format,
-                "content_type": FORMATS[req.response_format], "bytes": len(audio),
+                "content_type": FORMATS[req.response_format], "bytes": size,
                 "model": req.model.id, "voice": req.voice.name if req.voice else None,
                 "language": req.language, "segments": res.segments, "retries": res.retries,
                 "splits": res.splits, "batch_size": res.batch_size, "synthesis_seconds": round(elapsed, 2),
-                "rtf": round(elapsed / res.duration, 3) if res.duration else None,
-                "warnings": res.warnings, "timeline": res.timeline,
+                "rtf": round(elapsed / duration, 3) if duration else None,
+                "warnings": res.warnings,
             }
+            if res.clips is not None:
+                meta["clips"] = clips
+            else:
+                meta["timeline"] = res.timeline
             log.info("job %s done: %.1fs audio in %.1fs (%d segments, %d retries, %d splits)",
-                     job.id, res.duration, elapsed, res.segments, res.retries, res.splits)
+                     job.id, duration, elapsed, res.segments, res.retries, res.splits)
         except TTSError as e:
             error = TTSError(e.code, e.message, e.http_status, **e.details)
             log.warning("job %s failed: %s %s", job.id, e.code, e.message)
         except Exception as e:  # noqa: BLE001 - report any worker failure to the client
             log.exception("job %s crashed", job.id)
-            seg = getattr(e, "tts_segment", None)
-            where = {} if seg is None else {"segment": seg}
-            at = "" if seg is None else f" (segment {seg})"
+            seg, clip = getattr(e, "tts_segment", None), getattr(e, "tts_clip", None)
+            where = ({} if seg is None else {"segment": seg}) | ({} if clip is None else {"clip": clip})
+            at = "" if seg is None else (f" (segment {seg})" if clip is None else f" (clip '{clip}' segment {seg})")
             if type(e).__name__ == "OutOfMemoryError":
                 error = TTSError("gpu_out_of_memory", f"GPU out of memory{at}: {e}", 500, **where)
             else:
@@ -354,12 +385,12 @@ class Scheduler:
             torch.cuda.empty_cache()
         with self.cond:
             job.finished = time.time()
-            if error is None and self._held_bytes() + len(audio) > self.cfg.max_result_bytes:
-                error = TTSError("results_full", f"The result ({len(audio)} bytes) does not fit in max_result_bytes "
+            if error is None and self._held_bytes() + size > self.cfg.max_result_bytes:
+                error = TTSError("results_full", f"The result ({size} bytes) does not fit in max_result_bytes "
                                  f"({self.cfg.max_result_bytes}) next to unexpired results; retry later.", 503,
-                                 held_bytes=self._held_bytes(), result_bytes=len(audio))
+                                 held_bytes=self._held_bytes(), result_bytes=size)
             if error is None:
-                job.audio, job.meta, job.status = audio, meta, "succeeded"
+                job.audio, job.clip_audio, job.meta, job.status = audio, clip_audio, meta, "succeeded"
             else:
                 job.error, job.error_http_status, job.status = error.to_dict(), error.http_status, "failed"
             self.running = None

@@ -2,7 +2,8 @@
 
   tts say "你好" -o /abs/path/hello.wav --language zh [--voice NAME] [--model ID] [--overwrite]
   tts say -f script.txt -o /abs/out.mp3        (-f - reads stdin)
-  tts job <job_id> [--wait] [-o /abs/out.wav]  (status of / fetch a job, e.g. after --no-wait)
+  tts clips clips.json -d /abs/dir -l zh [--voice NAME] (one file per clip: [{"id": "s01", "text": "..."}])
+  tts job <job_id> [--wait] [-o /abs/out.wav | -d /abs/dir]  (status of / fetch a job, e.g. after --no-wait)
   tts cancel <job_id>                          (stop a job that is no longer needed)
   tts jobs                                     (jobs the service still knows, newest first)
   tts unload                                   (free GPU memory now; refused while jobs run or wait)
@@ -11,7 +12,8 @@
   tts models | tts voices [--model ID] | tts health
   --timeline (say / job): also report each segment's start/end seconds and text
 
-Exit codes: 0 done, 1 error (JSON on stderr), 2 usage error, 3 still pending (--no-wait / --timeout).
+Exit codes: 0 done, 1 error (JSON on stderr), 2 usage error, 3 still pending (--no-wait / --timeout),
+4 clips job finished but some clips failed or were not written (result on stdout says which).
 """
 import argparse
 import asyncio
@@ -19,10 +21,11 @@ import json
 import shlex
 import sys
 
-from local_tts.client import (DEFAULT_URL, ClientError, Deadline, TTSClient, as_client_error, check_target, pending,
-                              raise_job_error, resolve_output_path, resumable, with_timeline)
+from local_tts.client import (DEFAULT_URL, ClientError, Deadline, TTSClient, as_client_error, check_target, clip_paths,
+                              pending, raise_job_error, resolve_output_dir, resolve_output_path, resumable,
+                              with_timeline)
 
-EXIT_ERROR, EXIT_PENDING = 1, 3
+EXIT_ERROR, EXIT_PENDING, EXIT_PARTIAL = 1, 3, 4
 
 
 def _print(obj, as_json: bool, human: str) -> None:
@@ -59,9 +62,9 @@ def _show_result(r: dict, a) -> None:
             print(f"[tts] warning: {w}", file=sys.stderr)
 
 
-def _fetch_command(a, job_id: str, path) -> str:
+def _fetch_command(a, job_id: str, path, clips: bool = False) -> str:
     """A copy-pasteable command that resumes waiting for a job (keeps --url / --overwrite)."""
-    cmd = ["tts", "job", job_id, "--wait", "-o", str(path)]
+    cmd = ["tts", "job", job_id, "--wait", "-d" if clips else "-o", str(path)]
     if a.url != DEFAULT_URL:
         cmd += ["--url", a.url]
     if a.overwrite:
@@ -112,23 +115,98 @@ async def cmd_say(c: TTSClient, a) -> int:
         err.details["output_path"] = str(path)
         if resumable(err):  # a failed or forgotten job cannot be fetched, only resubmitted
             err.details["fetch_command"] = fetch
+        else:
+            err.details["recovery"] = ("The job failed or the service no longer has it; fetching cannot help. Fix the "
+                                       "cause if there is one and run tts say again.")
         raise err from None
     _show_result(r, a)
     return 0
 
 
+def _show_clips(r: dict, a) -> int:
+    r = with_timeline(r, a.timeline)
+    lines = [f"{r['status']}: {r['output_dir']}  (model={r['model']}, voice={r['voice'] or 'default'})"]
+    for clip in r["clips"]:
+        if clip["status"] == "completed":
+            lines.append(f"  {clip['id']}: {clip['path']}  ({clip['duration_seconds']:.2f}s)")
+            for t in clip.get("timeline", []):
+                lines.append(f"      {t['start']:8.3f}-{t['end']:8.3f}  [p{t['paragraph']} s{t['index']}] {t['text']}")
+        else:
+            lines.append(f"  {clip['id']}: FAILED ({clip['stage']}) {clip['error']['code']}: {clip['error']['message']}")
+    _print(r, a.json, "\n".join(lines))
+    if not a.json:
+        for w in r.get("warnings", []) + [w for clip in r["clips"] for w in clip.get("warnings", [])]:
+            print(f"[tts] warning: {w}", file=sys.stderr)
+    return 0 if r["status"] == "completed" else EXIT_PARTIAL
+
+
+def _read_clips(source: str) -> list[tuple[str, str]]:
+    raw = sys.stdin.buffer.read() if source == "-" else open(source, "rb").read()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        clips = [(str(c["id"]), str(c["text"])) for c in data]
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
+        raise ClientError("invalid_input", f"{source}: expected a JSON list of {{\"id\": ..., \"text\": ...}} "
+                          f"({type(e).__name__}: {e}).") from None
+    if not clips:
+        raise ClientError("invalid_input", f"{source}: no clips.")
+    return clips
+
+
+async def cmd_clips(c: TTSClient, a) -> int:
+    clips = _read_clips(a.file)
+    directory = resolve_output_dir(a.dir)
+    fmt = a.format or "wav"
+    for path in clip_paths(directory, [i for i, _ in clips], fmt).values():
+        check_target(path, a.overwrite)
+    deadline = Deadline(a.timeout)
+    job = await c.submit(None, clips=clips, model=a.model, voice=a.voice, language=a.language, fmt=fmt,
+                         seed=a.seed, deadline=deadline)
+    fetch = _fetch_command(a, job["id"], directory, clips=True)
+    try:
+        if not a.no_wait:
+            job = await c.wait(job["id"], deadline, last=job, on_progress=_progress(a.quiet or a.json))
+        if job["status"] in ("queued", "running"):
+            pend = pending(job) | {"output_dir": str(directory), "fetch_command": fetch}
+            _print(pend, a.json, f"pending: job {job['id']} ({job['status']}); fetch later with:\n  {fetch}")
+            return EXIT_PENDING
+        r = await c.save_clips(job, directory, a.overwrite)
+    except Exception as e:  # noqa: BLE001 - the job exists: say how to recover instead of resubmitting
+        err = as_client_error(e)
+        err.details.setdefault("job_id", job["id"])
+        err.details["output_dir"] = str(directory)
+        if resumable(err):
+            err.details["fetch_command"] = fetch
+        else:
+            err.details["recovery"] = ("The job failed or the service no longer has it; fetching cannot help. Fix the "
+                                       "cause if there is one and run tts clips again (only the clips still needed).")
+        raise err from None
+    if r["status"] != "completed":
+        r["fetch_command"] = fetch  # writes the clips that are still missing
+    return _show_clips(r, a)
+
+
 async def cmd_job(c: TTSClient, a) -> int:
     # Until the job's format is known, errors name the path as given (an extensionless path gets
     # the job's extension later, so guessing .wav here could make the fetch command fail).
-    target = a.output
+    if a.output and a.dir:
+        raise ClientError("invalid_request", "Give -o (one audio) or -d (a clips job), not both.")
+    target = a.output or a.dir
     try:
         if a.output:  # validate the target before waiting
             resolve_output_path(a.output, None)
+        if a.dir:
+            directory = resolve_output_dir(a.dir)
         if a.wait:
             job = await c.wait(a.job_id, Deadline(a.timeout), on_progress=_progress(a.quiet or a.json))
         else:
             job = await c.job(a.job_id)
         raise_job_error(job)
+        if job["status"] == "succeeded" and a.dir:
+            r = await c.save_clips(job, directory, a.overwrite)
+            if r["status"] != "completed":
+                r["fetch_command"] = _fetch_command(a, a.job_id, directory, clips=True)
+            return _show_clips(r, a)
         if job["status"] == "succeeded" and a.output:
             path, _ = resolve_output_path(a.output, job["result"]["format"])
             target = str(path)
@@ -139,12 +217,15 @@ async def cmd_job(c: TTSClient, a) -> int:
         err = as_client_error(e)
         err.details.setdefault("job_id", a.job_id)
         if target:
-            err.details["output_path"] = target
+            err.details["output_dir" if a.dir else "output_path"] = target
             if resumable(err):
-                err.details["fetch_command"] = _fetch_command(a, a.job_id, target)
+                err.details["fetch_command"] = _fetch_command(a, a.job_id, target, clips=bool(a.dir))
+        if not resumable(err):
+            err.details["recovery"] = ("The job failed or the service no longer has it; fetching cannot help. Fix the "
+                                       "cause if there is one and submit it again (tts say / tts clips).")
         raise err from None
     if not a.timeline and job.get("result"):  # the timeline repeats the whole input text
-        job = job | {"result": {k: v for k, v in job["result"].items() if k != "timeline"}}
+        job = job | {"result": with_timeline(job["result"], False)}
     _print(job, True, "")
     return 0 if job["status"] == "succeeded" else EXIT_PENDING
 
@@ -248,9 +329,25 @@ def main(argv=None) -> int:
     j.add_argument("--wait", action="store_true")
     j.add_argument("--timeout", type=float)
     j.add_argument("-o", "--output", help="save the audio here when the job has succeeded")
+    j.add_argument("-d", "--dir", help="clips job: write each clip to DIR/<id>.<format> when it has succeeded")
     j.add_argument("--overwrite", action="store_true")
     j.add_argument("--timeline", action="store_true", help="report each segment's start/end seconds and text")
     j.set_defaults(func=cmd_job)
+
+    cl = sub.add_parser("clips", parents=[common], help="synthesize several clips, one file each, in one job")
+    cl.add_argument("file", help='JSON list of {"id": ..., "text": ...} ("-" = stdin); id names the file')
+    cl.add_argument("-d", "--dir", help="absolute output directory; default a new folder under "
+                    "~/.local/share/local-tts/output/")
+    cl.add_argument("-l", "--language")
+    cl.add_argument("-v", "--voice")
+    cl.add_argument("-m", "--model")
+    cl.add_argument("--format", choices=["wav", "flac", "mp3"], help="default wav")
+    cl.add_argument("--seed", type=int)
+    cl.add_argument("--overwrite", action="store_true")
+    cl.add_argument("--no-wait", action="store_true")
+    cl.add_argument("--timeout", type=float)
+    cl.add_argument("--timeline", action="store_true")
+    cl.set_defaults(func=cmd_clips)
 
     k = sub.add_parser("cancel", parents=[common], help="cancel a queued or running job")
     k.add_argument("job_id")

@@ -448,3 +448,81 @@ def test_progress_reports_the_total_before_the_first_generation():
     req = SynthesisRequest(model=adapter.entry, voice=None, text="第一段。\n\n第二段。", language="zh")
     synthesize(adapter, req, SegmentingConfig(), lambda d, t: seen.append((d, t, len(adapter.calls))))
     assert seen[0] == (0, 2, 0) and seen[-1][:2] == (2, 2)
+
+
+# --- clips jobs ------------------------------------------------------------------------------------
+
+CLIPS = [(f"s{i:02d}", f"第{i}頁的旁白在這裡，這是稍微長一點的句子。") for i in range(6)]
+
+
+def run_clips(adapter, clips, voice=None, **cfg):
+    req = SynthesisRequest(model=adapter.entry, voice=voice, text="\n\n".join(t for _, t in clips), language="zh",
+                           clips=clips)
+    return synthesize(adapter, req, SegmentingConfig(**cfg))
+
+
+def test_clips_batch_across_clips_and_match_single_jobs():
+    a = BatchFake(lambda t, i: "ok", 4)
+    res = run_clips(a, CLIPS, voice=VOICE)
+    assert [len(b) for b in a.batches] == [4, 2]  # one-segment clips still share batches
+    assert res.clips is not None and res.audio.shape[1] == 0 and res.segments == 6
+    for (cid, text), clip in zip(CLIPS, res.clips):
+        alone = run_with(FakeAdapter(lambda t, i: "ok"), text, voice=VOICE)
+        assert clip.id == cid and clip.error is None and np.array_equal(clip.audio, alone.audio)
+        assert clip.timeline == alone.timeline and clip.timeline[0]["start"] == 0.0
+
+
+def test_clip_pauses_and_paragraphs_stay_inside_each_clip():
+    clips = [("a", "[pause 1s]第一頁。\n\n第二段。[pause 0.5s]"), ("b", "第二頁。")]
+    res = run_clips(FakeAdapter(lambda t, i: 1.0), clips, voice=VOICE)
+    a, b = res.clips
+    # lead 1 s + 1 s speech + 0.8 s paragraph gap + 1 s speech + trail 0.5 s; b has no gap at all
+    assert a.audio.shape[1] == int(4.3 * SR) and b.audio.shape[1] == SR
+    assert [t["paragraph"] for t in a.timeline] == [0, 1] and a.timeline[0]["start"] == 1.0
+
+
+def test_a_failing_clip_does_not_fail_the_others():
+    bad = CLIPS[2][1]
+    a = FakeAdapter(lambda t, i: "short" if t == bad else "ok")
+    res = run_clips(a, CLIPS, voice=VOICE)
+    failed = [c for c in res.clips if c.error is not None]
+    assert [c.id for c in failed] == ["s02"] and failed[0].audio is None
+    assert failed[0].error["code"] == "segment_failed" and failed[0].error["clip"] == "s02"
+    assert failed[0].error["message"].startswith("Clip 's02': ")
+    assert all(c.audio is not None for c in res.clips if c.id != "s02")
+
+
+def test_all_clips_failing_fails_the_job():
+    with pytest.raises(TTSError) as e:
+        run_clips(FakeAdapter(lambda t, i: "short"), CLIPS[:2], voice=VOICE)
+    assert e.value.code == "segment_failed" and [c["clip"] for c in e.value.details["clips"]] == ["s00", "s01"]
+
+
+def test_unvoiced_clips_share_the_first_long_clips_voice():
+    clips = [("title", "標題。"), ("body", "第一頁的旁白在這裡，這是稍微長一點的句子。"), ("end", "結尾頁的旁白也在這裡，一樣稍微長一點。")]
+    a = FakeAdapter(lambda t, i: "ok")
+    res = run_clips(a, clips)
+    # the short title is rendered again with the body's voice; later clips use it from the start
+    assert [ref_text(r) for _, r in a.calls] == [None, None, "第一頁的", "第一頁的"]
+    assert a.calls[3][0] == "標題。" and not res.warnings
+    title = res.clips[0]
+    assert title.audio.shape[1] > 0
+
+
+def test_unvoiced_short_clips_warn_that_voices_may_differ():
+    res = run_clips(FakeAdapter(lambda t, i: "ok"), [("a", "一。"), ("b", "二。")])
+    assert len(res.warnings) == 1 and "pass a voice" in res.warnings[0]
+
+
+def test_clip_warnings_belong_to_their_clip():
+    target = CLIPS[1][1]
+    res = run_clips(FakeAdapter(lambda t, i: 0.5 * estimate_seconds(t) if t == target else "ok"), CLIPS, voice=VOICE)
+    assert [bool(c.warnings) for c in res.clips] == [False, True, False, False, False, False]
+    assert res.clips[1].warnings[0].startswith("clip 's01' segment 0:")
+
+
+def test_a_batch_crash_in_a_clips_job_names_the_clip():
+    a = BatchFake(lambda t, i: "ok", 4, batch_error=RuntimeError("boom"))
+    with pytest.raises(RuntimeError) as e:
+        run_clips(a, CLIPS, voice=VOICE)
+    assert e.value.tts_clip == "s00" and e.value.tts_segment == 0

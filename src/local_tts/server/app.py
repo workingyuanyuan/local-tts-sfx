@@ -10,6 +10,7 @@ like unknown body fields.
 import asyncio
 import logging
 import math
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -58,6 +59,24 @@ class SpeechRequest(BaseModel):
 
 EXTENSION_FIELDS = ("language", "seed")
 
+# A clips job (POST /v1/jobs with `clips` instead of `input`): at most this many clips, ids usable as
+# file names. The input limits (characters, pauses) apply to all clips together.
+MAX_CLIPS = 100
+CLIP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+class ClipInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    input: str
+
+
+class JobRequest(SpeechRequest):
+    """POST /v1/jobs: `input`, or `clips` (one audio per clip, synthesized in one pass)."""
+    input: Optional[str] = None
+    clips: Optional[list[ClipInput]] = None
+
 
 def build_app() -> FastAPI:
     cfg = load_server_config()
@@ -92,11 +111,15 @@ def build_app() -> FastAPI:
         return JSONResponse({"error": e.to_dict()}, status_code=e.http_status, headers=headers)
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_: Request, e: RequestValidationError):
+    async def validation_error(request: Request, e: RequestValidationError):
         extra = [str(err["loc"][-1]) for err in e.errors() if err["type"] == "extra_forbidden"]
         if extra:
+            # ("body", "clips", <index>, <field>) is a field inside a clip; ("body", "clips") the clips field itself
+            in_clip = any(err["type"] == "extra_forbidden" and len(err["loc"]) > 3 and err["loc"][1] == "clips"
+                          for err in e.errors())
+            model = ClipInput if in_clip else JobRequest if request.url.path == "/v1/jobs" else SpeechRequest
             err = TTSError("unsupported_parameter", f"Unsupported parameter(s): {', '.join(extra)}.", 400,
-                           parameters=extra, supported=sorted(SpeechRequest.model_fields))
+                           parameters=extra, supported=sorted(model.model_fields))
         else:
             err = TTSError("invalid_request", "Invalid request body.", 400,
                            errors=[{"loc": list(x["loc"]), "msg": x["msg"]} for x in e.errors()])
@@ -133,31 +156,68 @@ def build_app() -> FastAPI:
         if body.response_format not in FORMATS:
             raise TTSError("unsupported_format", f"Unsupported response_format '{body.response_format}'.", 400,
                            available=sorted(FORMATS))
-        if not body.input.strip():
-            raise TTSError("empty_input", "Input is empty.", 400)
-        if len(body.input) > MAX_INPUT_CHARS:
-            raise TTSError("input_too_long", f"Input exceeds {MAX_INPUT_CHARS} characters.", 400,
-                           max_chars=MAX_INPUT_CHARS)
-        pauses = pause_values(body.input)
+        clips = getattr(body, "clips", None)
+        if (body.input is None) == (clips is None):
+            raise TTSError("invalid_request", "Give either input or clips.", 400)
+        if clips is not None:
+            if not 1 <= len(clips) <= MAX_CLIPS:
+                raise TTSError("invalid_request", f"clips must hold 1-{MAX_CLIPS} clips.", 400, max_clips=MAX_CLIPS)
+            ids = [c.id for c in clips]
+            bad = [i for i in ids if not CLIP_ID_RE.fullmatch(i)]
+            if bad:
+                raise TTSError("invalid_clip_id", "Clip ids are 1-64 characters: letters, digits, '_', '-' or '.', "
+                               "starting with a letter or digit (they name the output files).", 400, ids=bad)
+            dup = sorted({i for i in ids if ids.count(i) > 1})
+            if dup:
+                raise TTSError("invalid_clip_id", f"Duplicate clip id(s): {', '.join(dup)}.", 400, ids=dup)
+            empty = [c.id for c in clips if not c.input.strip()]
+            if empty:
+                raise TTSError("empty_input", f"Clip(s) with empty input: {', '.join(empty)}.", 400, clips=empty)
+            texts = [c.input for c in clips]
+        else:
+            if not body.input.strip():
+                raise TTSError("empty_input", "Input is empty.", 400)
+            texts = [body.input]
+        if sum(map(len, texts)) > MAX_INPUT_CHARS:
+            raise TTSError("input_too_long", f"Input exceeds {MAX_INPUT_CHARS} characters"
+                           f"{' (all clips together)' if clips else ''}.", 400, max_chars=MAX_INPUT_CHARS)
+        pauses = [p for t in texts for p in pause_values(t)]
         if any(not math.isfinite(p) or p > MAX_PAUSE_SECONDS for p in pauses) or sum(pauses) > MAX_TOTAL_PAUSE_SECONDS:
             raise TTSError("invalid_pause", f"[pause] markers must each be <= {MAX_PAUSE_SECONDS:.0f}s and "
                            f"total <= {MAX_TOTAL_PAUSE_SECONDS:.0f}s.", 400,
                            max_pause_seconds=MAX_PAUSE_SECONDS, max_total_pause_seconds=MAX_TOTAL_PAUSE_SECONDS)
         language = adapter.normalize_language(body.language)
-        return SynthesisRequest(model=entry, voice=voice, text=body.input, response_format=body.response_format,
-                                language=language, seed=body.seed)
+        return SynthesisRequest(model=entry, voice=voice, text="\n\n".join(texts), response_format=body.response_format,
+                                language=language, seed=body.seed,
+                                clips=None if clips is None else [(c.id, c.input) for c in clips])
 
-    def audio_response(job: Job) -> Response:
-        status, error, http_status, audio, m = scheduler.outcome(job)
+    def audio_response(job: Job, clip: Optional[str] = None) -> Response:
+        is_clips = job.request.clips is not None
+        if is_clips and clip is None:
+            raise TTSError("clip_required", f"Job '{job.id}' is a clips job: fetch each clip with ?clip=<id>.", 400,
+                           clips=[c for c, _ in job.request.clips])
+        if not is_clips and clip is not None:
+            raise TTSError("invalid_request", f"Job '{job.id}' has one audio; omit clip.", 400)
+        if is_clips and clip not in {c for c, _ in job.request.clips}:
+            raise TTSError("unknown_clip", f"Job '{job.id}' has no clip '{clip}'.", 404,
+                           clips=[c for c, _ in job.request.clips])
+        status, error, http_status, audio, m = scheduler.outcome(job, clip)
         if error is not None:
             details = {k: v for k, v in error.items() if k not in ("code", "message")}
             raise TTSError(error["code"], error["message"], http_status, job_id=job.id, **details)
         if status != "succeeded":
             raise TTSError("job_not_finished", f"Job '{job.id}' is {status}.", 409, job_status=status)
+        segments, duration = m["segments"], m["duration"]
+        if clip is not None:
+            info = next(c for c in m["clips"] if c["id"] == clip)
+            if info["status"] != "succeeded":
+                raise TTSError("clip_failed", f"Clip '{clip}' failed: {info['error']['message']}", 409,
+                               job_id=job.id, clip=clip, clip_error=info["error"])
+            segments, duration = info["segments"], info["duration"]
         headers = {  # names may be non-ASCII (registry keys), so they are percent-encoded
             "X-TTS-Job-Id": job.id, "X-TTS-Model": quote(m["model"]), "X-TTS-Voice": quote(m["voice"] or ""),
-            "X-TTS-Duration": str(m["duration"]), "X-TTS-Sample-Rate": str(m["sample_rate"]),
-            "X-TTS-Channels": str(m["channels"]), "X-TTS-Segments": str(m["segments"]),
+            "X-TTS-Duration": str(duration), "X-TTS-Sample-Rate": str(m["sample_rate"]),
+            "X-TTS-Channels": str(m["channels"]), "X-TTS-Segments": str(segments),
             "X-TTS-Language": quote(m["language"] or ""), "X-TTS-Retries": str(m["retries"]),
             "X-TTS-Splits": str(m["splits"]),
         }
@@ -247,7 +307,7 @@ def build_app() -> FastAPI:
         return await asyncio.to_thread(audio_response, job)
 
     @app.post("/v1/jobs", status_code=202)
-    def create_job(body: SpeechRequest, request: Request,
+    def create_job(body: JobRequest, request: Request,
                    idempotency_key_: Optional[str] = Header(None, alias="Idempotency-Key")):
         # A repeated Idempotency-Key returns the job created by the first request (no new generation).
         strict_query(request)
@@ -282,9 +342,9 @@ def build_app() -> FastAPI:
         return JSONResponse(scheduler.snapshot(job), status_code=200 if stopped else 202)
 
     @app.get("/v1/jobs/{job_id}/audio")
-    def get_job_audio(job_id: str, request: Request):
-        strict_query(request)
-        return audio_response(scheduler.get(job_id))
+    def get_job_audio(job_id: str, request: Request, clip: Optional[str] = None):
+        strict_query(request, ("clip",))
+        return audio_response(scheduler.get(job_id), clip)
 
     return app
 

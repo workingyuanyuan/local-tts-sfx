@@ -35,7 +35,7 @@ os.umask(_UMASK)
 
 
 def _check_name(name: str) -> None:
-    if not NAME_RE.match(name):
+    if not NAME_RE.fullmatch(name):
         raise TTSError("invalid_voice_name", "Voice names are 1-64 characters: letters, digits, '_', '-' or '.', "
                        "starting with a letter or digit.", 400, name=name)
 

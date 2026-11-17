@@ -91,8 +91,8 @@ def test_audio_response_consistent_when_job_fails_during_read(client):
     wait_status(client, jid, {"running"})
     original = type(sched).outcome
 
-    def outcome_then_fail(self, job):
-        snapshot = original(self, job)
+    def outcome_then_fail(self, job, clip=None):
+        snapshot = original(self, job, clip)
         GATE.set()
         job.done.wait(5)
         assert job.status == "failed"

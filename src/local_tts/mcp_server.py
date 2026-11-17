@@ -18,9 +18,10 @@ from typing import Any, Literal, Optional
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict, Field
 
-from local_tts.client import (ClientError, Deadline, TTSClient, as_client_error, check_target, pending,
-                              resolve_output_path, resumable, with_timeline)
+from local_tts.client import (ClientError, Deadline, TTSClient, as_client_error, check_target, clip_paths, pending,
+                              resolve_output_dir, resolve_output_path, resumable, with_timeline)
 
 MAX_WAIT = 240.0
 
@@ -42,21 +43,13 @@ def _default_wait() -> float:
 
 DEFAULT_WAIT = _default_wait()
 
-INSTRUCTIONS = """Local text-to-speech (runs on this machine's GPU). Use it whenever a task needs spoken
-audio: video narration, slide voice-over, reading teaching material aloud, audio previews.
-- Write output into the task's project directory with an absolute output_path (.wav/.flac/.mp3).
-- Pass language (e.g. "zh", "en") when known. Omit voice for the model's default voice, or pick one
-  from list_voices to clone it. Omit model to use the default.
-- Text may contain [pause 1.5s] markers; blank lines are paragraph breaks. Long text is fine.
-- Long narrations return status "pending" with "next": keep calling get_speech_job with exactly
-  next.arguments (job_id, the same absolute output_path, overwrite if it was set) until "completed"
-  (always pass the path: after an MCP restart the default location is outside the project). Never call
-  generate_speech again for the same text while a job is pending. If an error carries a job_id,
-  follow its "recovery" field: resume interrupted calls the same way; a failed job (job_status
-  "failed") or an unknown_job needs a new generate_speech call.
-- A completed result with "warnings" may be missing a sentence: regenerate it once (overwrite=true).
-- timeline=true adds each segment's start/end seconds and text (to cut video or slides at paragraph
-  breaks from one long call). cancel_speech_job stops a job you no longer need (e.g. wrong text)."""
+INSTRUCTIONS = """Local text-to-speech on this machine's GPU: use it whenever a task needs spoken audio
+(narration, voice-over, reading aloud). Write into the task's project with absolute paths; pass language.
+- Several clips (one per slide or scene): one generate_speech_clips call. Separate calls without a voice
+  sound like different speakers: pass the same voice (list_voices) to calls that must sound alike.
+- "pending": call next.tool with exactly next.arguments until done; never resubmit pending text
+  (list_speech_jobs finds a lost job_id). An error with a job_id: follow its "recovery".
+- "warnings" on a result: a sentence may be missing; regenerate that file or clip once (overwrite=true)."""
 
 # Writing tools create files; with overwrite=true they replace one, hence destructive. Local only.
 WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False)
@@ -99,6 +92,7 @@ class JobEntry:
     default_path: Optional[Path] = None   # output_path given to generate_speech
     default_overwrite: bool = False
     default_timeline: bool = False
+    default_dir: Optional[Path] = None    # output_dir given to generate_speech_clips
     saved: dict[Path, dict] = field(default_factory=dict)  # path -> result, for idempotent repeats
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     used: float = field(default_factory=time.monotonic)
@@ -132,14 +126,24 @@ def _error(e: Exception, **context: Any) -> ToolError:
         log.exception("unexpected tool failure")
     ce = as_client_error(e)
     err = ce.to_dict()
-    if not resumable(ce):  # failed or forgotten: get_speech_job would only repeat this error
+    clips = "output_dir" in context
+    submit, fetch = ("generate_speech_clips", "get_speech_clips") if clips else ("generate_speech", "get_speech_job")
+    if ce.code == "clips_job":
+        context["recovery"] = "Call get_speech_clips with this job_id and the output_dir for its files."
+    elif ce.code == "not_a_clips_job":
+        context["recovery"] = "Call get_speech_job with this job_id and the output_path for its file."
+    elif not resumable(ce):  # failed or forgotten: waiting again would only repeat this error
         context["recovery"] = ("The job failed or the service no longer has it (restarted or expired); it cannot "
                                "be resumed. Fix the cause above if there is one (e.g. rephrase or shorten the "
-                               "named segment) and call generate_speech again.")
+                               f"named segment) and call {submit} again.")
     elif context.get("job_id"):
-        args = _resume_args(context["job_id"], context.get("output_path"), context.get("overwrite", False),
-                            context.get("timeline", False))
-        context["recovery"] = (f"The job may still be running; call get_speech_job with "
+        if clips:
+            args = _clips_args(context["job_id"], context.get("output_dir"), context.get("overwrite", False),
+                               context.get("timeline", False))
+        else:
+            args = _resume_args(context["job_id"], context.get("output_path"), context.get("overwrite", False),
+                                context.get("timeline", False))
+        context["recovery"] = (f"The job may still be running; call {fetch} with "
                                f"{json.dumps(args, ensure_ascii=False)} instead of resubmitting.")
     context.pop("overwrite", None)
     context.pop("timeline", None)
@@ -156,6 +160,17 @@ def _resume_args(job_id: str, path, overwrite: bool, timeline: bool = False) -> 
     args: dict[str, Any] = {"job_id": job_id}
     if path is not None:
         args["output_path"] = str(path)
+    if overwrite:
+        args["overwrite"] = True
+    if timeline:
+        args["timeline"] = True
+    return args
+
+
+def _clips_args(job_id: str, directory, overwrite: bool, timeline: bool) -> dict[str, Any]:
+    args: dict[str, Any] = {"job_id": job_id}
+    if directory is not None:
+        args["output_dir"] = str(directory)
     if overwrite:
         args["overwrite"] = True
     if timeline:
@@ -203,6 +218,8 @@ async def _deliver(job_id: str, entry: JobEntry, output_path: Optional[str], ove
         if path in entry.saved:
             return with_timeline(entry.saved[path], timeline)
         job = await client.wait(job_id, deadline, last=last)
+        if job.get("clips_total") is not None:
+            raise ClientError("clips_job", f"Job {job_id} is a clips job: use get_speech_clips.", job_id=job_id)
         if job["status"] in ("queued", "running"):
             return _pending(job_id, pending(job), path, overwrite, timeline)
         result = await client.save(job, path, overwrite)
@@ -228,6 +245,90 @@ async def _generate(text, output_path, language, voice, model, fmt, overwrite, s
     except Exception as e:  # noqa: BLE001 - attach the job so the caller can recover
         _forget(job["id"], e)
         raise _error(e, job_id=job["id"], output_path=str(path), overwrite=overwrite, timeline=timeline) from None
+
+
+async def _deliver_clips(job_id: str, entry: JobEntry, output_dir: Optional[str], overwrite: bool, timeline: bool,
+                         deadline: Deadline, last: Optional[dict] = None) -> dict[str, Any]:
+    """The clips counterpart of _deliver: wait within the deadline, then write every clip once."""
+    timeline = timeline or entry.default_timeline
+    directory = resolve_output_dir(output_dir) if output_dir else entry.default_dir
+    if directory is None:
+        raise ClientError("invalid_path", "Pass output_dir: the directory given to generate_speech_clips.")
+    overwrite = overwrite or (directory == entry.default_dir and entry.default_overwrite)
+    try:
+        async with asyncio.timeout(deadline.remaining() or 0.01):
+            await entry.lock.acquire()
+    except TimeoutError:  # another call for this job holds the lock until its own deadline
+        job = last or await client.job(job_id, timeout=deadline.request_timeout(10.0))
+        return _clips_pending(job_id, job, directory, overwrite, timeline)
+    try:
+        job = await client.wait(job_id, deadline, last=last)
+        if job.get("clips_total") is None:
+            raise ClientError("not_a_clips_job", f"Job {job_id} has one audio: use get_speech_job.", job_id=job_id)
+        if job["status"] in ("queued", "running"):
+            return _clips_pending(job_id, job, directory, overwrite, timeline)
+        result = await client.save_clips(job, directory, overwrite)  # skips files already identical
+        log.info("job %s: %d clip(s) in %s, status %s", job_id, len(result["clips"]), directory, result["status"])
+        return _clips_recovery(with_timeline(result, timeline), overwrite, timeline)
+    finally:
+        entry.lock.release()
+
+
+def _clips_pending(job_id: str, job: dict, directory: Path, overwrite: bool, timeline: bool) -> dict[str, Any]:
+    return pending(job) | {"clips_total": job.get("clips_total"), "output_dir": str(directory),
+                           "next": {"tool": "get_speech_clips",
+                                    "arguments": _clips_args(job_id, directory, overwrite, timeline)}}
+
+
+def _clips_recovery(result: dict[str, Any], overwrite: bool, timeline: bool) -> dict[str, Any]:
+    """A partial result says what to do about each kind of failed clip."""
+    if result["status"] == "completed":
+        return result
+    notes = []
+    synth = [c["id"] for c in result["clips"] if c.get("stage") == "synthesis"]
+    deliver = [c for c in result["clips"] if c.get("stage") == "delivery"]
+    if synth:
+        notes.append(f"Clips {', '.join(synth)} failed in synthesis (see each error): fix the cause if there is one "
+                     "and call generate_speech_clips with only those clips (same voice).")
+    if deliver:
+        exists = any(c["error"].get("code") == "output_exists" for c in deliver)
+        args = _clips_args(result["job_id"], result["output_dir"], overwrite or exists, timeline)
+        notes.append(f"Clips {', '.join(c['id'] for c in deliver)} were not written (see each error): call "
+                     f"get_speech_clips with {json.dumps(args, ensure_ascii=False)}"
+                     + (" (overwrite replaces the existing files)." if exists and not overwrite else "."))
+    return result | {"recovery": " ".join(notes)}
+
+
+async def _generate_clips(clips, output_dir, language, voice, model, fmt, overwrite, seed, timeline,
+                          wait_seconds) -> dict[str, Any]:
+    deadline = Deadline(_clamp_wait(wait_seconds))
+    directory = resolve_output_dir(output_dir)
+    fmt = fmt or "wav"
+    for path in clip_paths(directory, [c.id for c in clips], fmt).values():
+        check_target(path, overwrite)
+    job = await client.submit(None, clips=[(c.id, c.text) for c in clips], model=model, voice=voice,
+                              language=language, fmt=fmt, seed=seed, deadline=deadline)
+    entry = _entry(job["id"])
+    entry.fmt, entry.default_dir, entry.default_overwrite, entry.default_timeline = fmt, directory, overwrite, timeline
+    log.info("clips job %s submitted (%d clips) -> %s", job["id"], len(clips), directory)
+    try:
+        return await _deliver_clips(job["id"], entry, None, False, False, deadline, last=job)
+    except Exception as e:  # noqa: BLE001 - attach the job so the caller can recover
+        _forget(job["id"], e)
+        raise _error(e, job_id=job["id"], output_dir=str(directory), overwrite=overwrite, timeline=timeline) from None
+
+
+async def _get_clips(job_id, wait_seconds, output_dir, overwrite, timeline) -> dict[str, Any]:
+    deadline = Deadline(_clamp_wait(wait_seconds))
+    entry = _entry(job_id)
+    try:
+        return await _deliver_clips(job_id, entry, output_dir, overwrite, timeline, deadline)
+    except Exception as e:  # noqa: BLE001
+        _forget(job_id, e)
+        directory = output_dir or (str(entry.default_dir) if entry.default_dir else None)
+        raise _error(e, job_id=job_id, output_dir=directory,
+                     overwrite=overwrite or (entry.default_overwrite and directory == str(entry.default_dir)),
+                     timeline=timeline or entry.default_timeline) from None
 
 
 async def _get_job(job_id, wait_seconds, output_path, overwrite, timeline) -> dict[str, Any]:
@@ -339,6 +440,68 @@ async def get_speech_job(
         timeline: Include the per-segment timeline in the completed result (as in generate_speech).
     """
     return await _run(_get_job, job_id, wait_seconds, output_path, overwrite, timeline)
+
+
+class Clip(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="File name without extension: letters, digits, '_', '-', '.' (e.g. \"slide01\").")
+    text: str = Field(description="Text of this clip; [pause 1.5s] markers and blank lines work as in generate_speech.")
+
+
+@server.tool(annotations=WRITES)
+async def generate_speech_clips(
+    clips: list[Clip],
+    output_dir: Optional[str] = None,
+    language: Optional[str] = None,
+    voice: Optional[str] = None,
+    model: Optional[str] = None,
+    format: Optional[Literal["wav", "flac", "mp3"]] = None,
+    overwrite: bool = False,
+    seed: Optional[int] = None,
+    timeline: bool = False,
+    wait_seconds: float = DEFAULT_WAIT,
+) -> dict[str, Any]:
+    """Synthesize several clips (one per slide or scene) in one job, each to <output_dir>/<id>.<format>.
+    Faster than one generate_speech call per clip (clips share GPU batches), and one narrator: without
+    voice, all clips use the voice of the first clip that is at least 3 s long.
+
+    Args:
+        clips: [{"id": "slide01", "text": "..."}, ...] in order, up to 100; at most 20,000 characters in all.
+        output_dir: Absolute directory for the files (created if missing), normally inside the task's
+            project. Default: a new folder under ~/.local/share/local-tts/output/.
+        language, voice, model, overwrite, seed, timeline, wait_seconds: as in generate_speech, for all clips.
+        format: wav (default) | flac | mp3.
+
+    Returns: status "completed" (every clip written) or "partial", with output_dir, format, model, voice
+    and "clips": per clip id, path, status ("completed" with duration_seconds, segments, warnings?,
+    timeline?; or "failed" with stage "synthesis"/"delivery" and error), plus "recovery" saying what to do
+    about failed clips. A clip with "warnings" may be missing a sentence: regenerate it once. Or status
+    "pending" with job_id and "next" ({"tool": "get_speech_clips", "arguments": {...}}): call it until done.
+    """
+    return await _run(_generate_clips, clips, output_dir, language, voice, model, format, overwrite, seed, timeline,
+                      wait_seconds)
+
+
+@server.tool(annotations=WRITES)
+async def get_speech_clips(
+    job_id: str,
+    output_dir: Optional[str] = None,
+    wait_seconds: float = DEFAULT_WAIT,
+    overwrite: bool = False,
+    timeline: bool = False,
+) -> dict[str, Any]:
+    """Wait for a pending generate_speech_clips job and write its clips when done. Calling it again
+    returns the same result and only writes clips that are still missing.
+
+    Args:
+        job_id: The job_id from generate_speech_clips.
+        output_dir: The directory given to generate_speech_clips; always pass it (as in "next").
+        wait_seconds: How long this call waits (max 240) before returning "pending" again.
+        overwrite: Replace existing files (e.g. after output_exists for some clips).
+        timeline: Include each clip's per-segment timeline.
+    """
+    return await _run(_get_clips, job_id, wait_seconds, output_dir, overwrite, timeline)
 
 
 @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True,

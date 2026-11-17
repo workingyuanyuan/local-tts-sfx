@@ -92,6 +92,8 @@ tts say "你好，歡迎收看。" -l zh -o /abs/path/hello.wav            # 等
 tts say -f script.txt -l zh -v demo_zh_female -o /abs/out.mp3     # 從檔案讀（-f - 讀 stdin）
 tts say "..." -o /abs/out.wav --no-wait --json                    # 只送出，exit 3 並印出 job_id
 tts job <job_id> --wait -o /abs/out.wav                           # 等待並取回
+tts clips deck.json -d /abs/audio -l zh -v demo_zh_female         # 多片段：每個片段一個檔（<id>.wav）
+tts job <job_id> --wait -d /abs/audio                             # 取回多片段工作
 tts cancel <job_id>                                               # 取消不再需要的工作
 tts jobs                                                          # 服務仍記得的工作（最新的在前）
 tts unload                                                        # 立即卸載模型，釋放顯存
@@ -103,8 +105,9 @@ tts models | tts voices [-m MODEL] | tts health
 - `-o` 必須是絕對路徑；在 WSL 中，Windows 路徑（`C:\...`）會用 `wslpath` 轉換（非 WSL 環境回 `invalid_path`）；副檔名決定格式（.wav／.flac／.mp3）
 - 目標已存在時報錯，加 `--overwrite` 才覆寫；未指定 `-o` 時寫到 `~/.local/share/local-tts/output/<timestamp>.wav`
 - `--json` 輸出機器可讀結果；錯誤一律以 JSON 印到 stderr；結果有 `warnings`（可能漏句）時，文字模式會印到 stderr
-- exit code：0 完成、1 錯誤、2 用法錯誤、3 仍在處理（`--no-wait` 或 `--timeout` 到期，工作會繼續執行）
-- 工作送出後的錯誤附 `job_id`、`output_path` 與 `fetch_command`（接續等待用）；工作本身失敗（`job_status: "failed"`）或服務已不認得該工作（`unknown_job`，服務重啟或過期）時不附 `fetch_command`，需修正後重新送出（`tts say` 與 `tts job` 皆同）
+- exit code：0 完成、1 錯誤、2 用法錯誤、3 仍在處理（`--no-wait` 或 `--timeout` 到期，工作會繼續執行）、4 多片段工作已結束但有片段失敗或未寫入（結果說明是哪些，附 `fetch_command`）
+- `tts clips FILE`：FILE（`-` 為 stdin）是 JSON 陣列 `[{"id": "s01", "text": "..."}]`，見「多片段工作」；`-d` 為輸出目錄（絕對路徑；省略時在預設輸出目錄下建立新資料夾）
+- 工作送出後的錯誤附 `job_id`、`output_path`（多片段為 `output_dir`）與 `fetch_command`（接續等待用）；工作本身失敗（`job_status: "failed"`）或服務已不認得該工作（`unknown_job`，服務重啟或過期）時改附 `recovery`，需修正後重新送出（`tts say`、`tts clips` 與 `tts job` 皆同）
 - `--timeline`（`say`、`job`）：結果另附每段的時間軸（見 MCP 的 `timeline`）；`fetch_command` 會保留這個選項
 - `tts cancel`：排隊中的工作立即取消（印出 `cancelled`）；執行中的工作在正在生成的那一段（或那一批）完成時停止（印出 `cancelling`）
 - `tts jobs`：列出服務仍記得的工作（完成後約保留 1 小時）：id、狀態、錯誤碼、聲音與文字開頭，用來找回遺失的 `job_id`
@@ -121,6 +124,8 @@ stdio MCP server（`.venv/bin/tts-mcp`）。工具：
 |---|---|
 | `generate_speech` | `text`、`output_path`（絕對路徑）、`language`、`voice`、`model`、`format`、`overwrite`、`seed`、`timeline`、`wait_seconds`。完成時回傳 path、duration_seconds、sample_rate、channels、format、model、voice、segments；有段落偏短（可能漏句）時另附 `warnings`（含該段文字）；`timeline=true` 時另附 `timeline` |
 | `get_speech_job` | 等待 `pending` 的工作並寫檔；重複呼叫回傳同一結果；也接受 `timeline` |
+| `generate_speech_clips` | `clips`（`[{id, text}]`，依順序，最多 100 個）、`output_dir`（絕對路徑）與 `generate_speech` 相同的其他參數（套用到所有片段）。每個片段寫成 `<output_dir>/<id>.<format>`，見「多片段工作」。回傳 `completed`（全部寫入）或 `partial`（附 `recovery`），每個片段各有 path、status、duration_seconds、segments、`warnings`、`timeline`，失敗的片段附 `stage`（`synthesis`／`delivery`）與 `error`；或 `pending` 與 `next`（`get_speech_clips`） |
+| `get_speech_clips` | 等待多片段工作並寫檔：`job_id`、`output_dir`、`wait_seconds`、`overwrite`、`timeline`；重複呼叫只寫入仍缺少的片段 |
 | `cancel_speech_job` | 取消工作：排隊中立即取消（`cancelled`），執行中在正在生成的那一段（或那一批）完成時停止並捨棄（`cancelling`）；不寫檔；已完成的工作回 `job_finished` |
 | `list_speech_jobs` | 服務仍記得的工作（最新的在前；id、狀態、聲音、進度、文字開頭）：弄丟 `job_id` 時用來找回，不要重送同一段文字 |
 | `unload_model` | 沒有工作在執行或排隊時立即卸載模型，釋放顯存給其他 GPU 工作；否則回 `model_busy`。下一個請求會重新載入 |
@@ -149,7 +154,7 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | Claude Code | `~/.claude/skills/narration/SKILL.md`（user-level skill，依 description 自動觸發） |
 | Codex | `~/.codex/AGENTS.md` 中 `<!-- local-tts:begin -->`…`<!-- local-tts:end -->` 之間的區塊（其餘內容不動；第一次安裝前備份為 `AGENTS.md.bak-local-tts`） |
 
-規則內容：觸發情境（影片旁白、簡報配音、教材朗讀、有聲內容；只要文字稿時不觸發）、為耳朵寫稿（數字讀法、`[pause]`、拼音修正讀音）、模型與聲音選擇（未指定 `voice` 時每次呼叫音色不同，多段需同一旁白者時固定同一 `voice`）、輸出放在任務專案目錄、依用途切分檔案（每個場景／投影片一檔）、`pending` 時用 `get_speech_job` 接續、交給 ffmpeg 合成的方式與錯誤處理。修改規則後重新執行安裝腳本。
+規則內容：觸發情境（影片旁白、簡報配音、教材朗讀、有聲內容；只要文字稿時不觸發）、為耳朵寫稿（數字讀法、`[pause]`、拼音修正讀音）、模型與聲音選擇（未指定 `voice` 時每次呼叫音色不同，多段需同一旁白者時固定同一 `voice`）、輸出放在任務專案目錄、依用途切分檔案（每個場景／投影片一檔，用 `generate_speech_clips` 一次生成）、`pending` 時照 `next` 接續、註冊聲音需使用者同意、旁白完成後可 `unload_model`、交給 ffmpeg 合成的方式與錯誤處理。修改規則後重新執行安裝腳本。
 
 ## 設定
 
@@ -181,11 +186,11 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | PUT | `/v1/voices/{name}?description=&language=&models=&replace=` | 註冊聲音：本體是錄音檔本身（上限 16 MiB）；新增回 201、取代回 200 |
 | DELETE | `/v1/voices/{name}` | 移除註冊的聲音（內建聲音回 409 `voice_not_removable`） |
 | POST | `/v1/audio/speech` | 同步生成，直接回傳音訊 bytes（OpenAI 相容子集） |
-| POST | `/v1/jobs` | 非同步生成，回傳 202 與工作 ID（長旁白用，避免呼叫端逾時） |
+| POST | `/v1/jobs` | 非同步生成，回傳 202 與工作 ID（長旁白用，避免呼叫端逾時）；以 `clips` 取代 `input` 時為多片段工作 |
 | GET | `/v1/jobs` | 服務仍記得的工作摘要（最新的在前）：id、狀態、模型、聲音、格式、時間、進度、字數、文字開頭（80 字）、失敗時的 `error_code` |
 | GET | `/v1/jobs/{id}?wait=` | 工作狀態：queued／running／succeeded／failed、佇列位置、段落進度（開始生成時即有 `segments_total`）、`estimated_remaining_seconds`、結果中繼資料（含 `warnings`、`timeline`）或錯誤。`wait`（0–30 秒）為 long poll：工作結束、狀態或進度改變時立即回應，否則等滿 `wait` 秒 |
 | DELETE | `/v1/jobs/{id}` | 取消工作：排隊中 → 200，工作變為 failed（code `cancelled`）；執行中 → 202（`cancel_requested: true`），正在生成的那一段（或那一批）完成時即停止；重複取消 → 200；已完成 → 409 `job_finished` |
-| GET | `/v1/jobs/{id}/audio` | 取得完成工作的音訊 |
+| GET | `/v1/jobs/{id}/audio?clip=` | 取得完成工作的音訊；多片段工作必須以 `clip` 指定片段 id |
 
 請求本體（`/v1/audio/speech` 與 `/v1/jobs` 相同）：
 
@@ -199,6 +204,16 @@ Codex 另在 `~/.codex/config.toml` 的 `[mcp_servers.local-tts]` 設 `tool_time
 | `seed` | | **擴充欄位**：整數亂數種子（0 至 2³²−1）；只在相同 `batch_size` 下可重現 |
 
 其他欄位（如 OpenAI 的 `speed`、`instructions`）一律回 `unsupported_parameter`，不會被靜默忽略；未知的查詢參數也一樣。請求本體上限 256 KiB（解析前檢查；註冊聲音的上傳為 16 MiB）。
+
+### 多片段工作
+
+`POST /v1/jobs` 以 `clips: [{"id": "s01", "input": "..."}, ...]` 取代 `input`（兩者擇一；`/v1/audio/speech` 不接受 `clips`），一次生成多個各自獨立的音訊，例如每頁投影片一個檔。其他欄位套用到所有片段。
+
+- 限制：1–100 個片段；`id` 為 1–64 個英數字或 `_-.`（以英數字開頭，會成為檔名），不可重複；字數與 `[pause]` 上限以所有片段合計。
+- 所有片段的分段依序排成一列生成，所以短片段也能共用批次（`batch_size` > 1 時）。每個片段各自拼接，段落、`[pause]` 與時間軸都只在片段內計算，片段之間不加靜音。
+- 未指定 `voice` 時，整個工作共用一個參考：第一個至少 3 秒的片段之後的片段都用它，在它之前較短的片段會重新生成。所有片段都不到 3 秒時無法共用，結果的 `warnings` 會提醒改用 `voice`。
+- 某段最終失敗（`segment_failed`、`segment_truncated`）只讓該片段失敗，其餘照常完成；全部片段都失敗時整個工作失敗（錯誤附 `clips`）。其他錯誤（取消、顯存不足、載入失敗）讓整個工作失敗。
+- 結果的 `clips` 每個片段一筆：`id`、`status`（`succeeded`／`failed`）、`segments`，成功時有 `duration`、`bytes`、`sha256`、`warnings`、`timeline`，失敗時有 `error`（用戶端以 `sha256` 判斷目標檔是否已是這段音訊，重複取回時不再下載）；工作層級的 `duration`、`bytes` 為成功片段的合計，`warnings` 為工作層級的提醒。工作摘要與狀態另有 `clips`／`clips_total`。
 
 `POST /v1/jobs` 與 `/v1/audio/speech` 接受 `Idempotency-Key` 標頭（1–128 個可列印 ASCII 字元）：用同一個鍵重送，會拿回第一次建立的工作，不會再生成一次。`tts` CLI 與 `tts-mcp` 每次送出都帶新鍵；送出後沒收到回應（連線中斷、逾時）時，會用同一個鍵重試最多 2 次。
 
@@ -233,6 +248,11 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 | `voice_exists` / `voice_not_removable` | 409 | 註冊的名稱已存在（取代要帶 `replace`；內建聲音不可取代）／內建聲音不可移除 |
 | `invalid_voice_name` / `invalid_audio` | 400 | 名稱限英數字與 `_-.`（最多 64 字）／錄音無法解碼、不是 3–30 秒、超過 2 聲道或為靜音 |
 | `voice_config_error` | 500 | 註冊檔無法讀取，修正或移除後再註冊 |
+| `invalid_clip_id` | 400 | 多片段工作的片段 id 不合規則或重複；附 `ids` |
+| `clip_required` / `unknown_clip` | 400 / 404 | 取多片段工作的音訊時未指定或指定了不存在的 `clip`；附 `clips` |
+| `clip_failed` | 409 | 該片段生成失敗；附 `clip` 與 `clip_error` |
+| `clips_job` / `not_a_clips_job` | — | 用戶端：工作種類與取回方式不符（多片段工作用 `get_speech_clips`／`tts job -d`，一般工作用 `get_speech_job`／`tts job -o`） |
+| `download_incomplete` | — | 用戶端：同一次呼叫的音訊下載超過 30 秒，未寫入的片段再呼叫一次即可 |
 
 ## 長文處理
 
@@ -247,7 +267,8 @@ curl -s localhost:8765/v1/audio/speech -H 'Content-Type: application/json' \
 ## 已知限制
 
 - **模型錯讀與偶發漏字**：整句漏唸通常會讓該段明顯偏短而觸發重試（見「長文處理」第 4 點）；MOSS-TTS 偶爾會讀錯字（實測如「請求」「閒置」「過去」、罕用字「逕流」），也可能漏掉片段開頭幾個字（第 4 步 `scene03.wav` 漏了「計時器一響」）。句中少幾個字的漏唸是模型本身的問題，服務端不另加防護（時長檢查抓不到）。需要完整性保證時，用 `scripts/asr_compare.py` 回轉比對並人工聆聽；讀音可用拼音或常用字形修正（見 Agent 規則）。
-- **未指定 `voice` 的音色**：同一次呼叫內維持一致，不同呼叫之間音色不同；多段需同一旁白者時請固定 `voice`。
+- **參考音檔的內容會被照抄**：目標文字與參考音檔講的主題相近時，模型可能把參考音檔的詞句唸進輸出。實測 `demo_zh_female`（參考音檔唸「太陽系八大行星之一」）生成「太陽系的介紹。」等介紹太陽系的句子時，輸出變成「太陽系八大行星之一」，時長正常，所以時長檢查抓不到（`docs/clips-accept-report.md`）。選擇與內容主題無關的參考音檔；註冊聲音時也一樣。
+- **未指定 `voice` 的音色**：同一次呼叫（含同一個多片段工作）內維持一致，不同呼叫之間音色不同；多段需同一旁白者時請固定 `voice`，或用多片段工作一次生成。
 - 服務只綁定 `127.0.0.1`，沒有身分驗證；不要對外開放埠。
 
 ## 測試

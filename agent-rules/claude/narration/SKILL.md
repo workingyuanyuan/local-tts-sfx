@@ -15,16 +15,22 @@ MCP server `local-tts` (load them with ToolSearch if they are deferred):
 
 - `mcp__local-tts__generate_speech` — text → audio file. Returns path, duration_seconds, sample_rate,
   channels, format, model, voice; or status `pending` with a job_id for long text.
-- `mcp__local-tts__get_speech_job` — keep waiting for a pending job and write its file.
+- `mcp__local-tts__generate_speech_clips` — several clips (one per slide or scene) in one job, each to
+  `<output_dir>/<id>.<format>`: faster than one call per clip, and one narrator.
+- `mcp__local-tts__get_speech_job` / `get_speech_clips` — keep waiting for a pending job and write it.
 - `mcp__local-tts__cancel_speech_job` — stop a job that is no longer wanted (wrong text, superseded
-  script) so the GPU is free for the replacement.
+  script) so the GPU is free for the replacement. `list_speech_jobs` finds a lost job_id.
+- `mcp__local-tts__register_voice` — make a recording usable as `voice` (see step 2).
+- `mcp__local-tts__unload_model` — free the GPU memory once all narration is done.
 - `mcp__local-tts__list_voices`, `mcp__local-tts__list_models`, `mcp__local-tts__tts_status`.
 
 If MCP is unavailable, use the CLI with a bounded wait:
 `tts say -f script.txt -l zh -o /abs/path/narration.wav --json --timeout 45`.
-Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_id` and a
-`fetch_command`; run that command with `--timeout 45` added, repeating while it exits 3. Never rerun
-`tts say` for a job that exists.
+Several clips: `tts clips deck.json -d /abs/dir -l zh --json --timeout 45` (deck.json:
+`[{"id": "s01", "text": "..."}]`). Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the
+JSON has `job_id` and a `fetch_command`; run that command with `--timeout 45` added, repeating while
+it exits 3. 4 = clips finished but some failed or were not written (see each clip). Never rerun
+`tts say` / `tts clips` for a job that exists.
 
 ## Workflow
 
@@ -37,10 +43,11 @@ Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_
    `narration.txt`) so it can be revised and regenerated.
 2. **Choose model and voice.** Omit `model` (the default is the only one). Always pass `language`
    (`zh`, `en`, `ja`, …; the main language for mixed text).
-   - Without `voice`, the model picks a voice per call. Within one call the service tries to keep it
-     (later segments reuse the first ≥ 3 s of output as reference), but separate calls sound like
-     different speakers. Whenever several clips or batches must sound like the same narrator, pass the
-     same `voice` to every call: call `list_voices` and pick one matching the language.
+   - Without `voice`, the model picks a voice per call. Within one call (a `generate_speech_clips`
+     call included) the service tries to keep it (later segments reuse the first ≥ 3 s of output as
+     reference), but separate calls sound like different speakers. Whenever separate calls must sound
+     like the same narrator, pass the same `voice` to every call: call `list_voices` and pick one
+     matching the language.
    - To clone a recording, register it with `register_voice` (absolute path, 3-30 s of one speaker;
      usable at once). A real person's voice, including the user's own, only with the user's explicit
      approval: ask first.
@@ -50,22 +57,27 @@ Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_
    Never overwrite an existing file unless you are deliberately regenerating that file
    (`overwrite: true`); on `output_exists` choose another name or ask.
 4. **Split by how the audio will be used.** Video or slides: one file per scene or slide, so each
-   duration sets that scene's length. One continuous reading (article, story, podcast): one call with
-   the full text; the service splits long text itself. Pass `timeline: true` to also get each
+   duration sets that scene's length; generate them all with one `generate_speech_clips` call
+   (`clips: [{"id": "slide01", "text": ...}, ...]`, `output_dir` in the project) rather than one call
+   per clip. One continuous reading (article, story, podcast): one `generate_speech` call with the
+   full text; the service splits long text itself. Pass `timeline: true` to also get each
    segment's start/end seconds, paragraph and text; paragraphs (blank lines) always start a new
-   segment, so a single call can still be cut at paragraph breaks. Limits per call: 20,000 characters, each
-   `[pause]` ≤ 60 s and all pauses ≤ 600 s in total (`input_too_long` / `invalid_pause` otherwise).
-   Longer text: split at paragraph boundaries into batches with one fixed `voice`, generate them in
-   order and join them (step 6). Calls run one at a time on one GPU, so make them sequentially.
-5. **Long text and interrupted calls.** Status `pending` → call `get_speech_job` with the result's
-   `next.arguments` (job_id, the original absolute `output_path`, and `overwrite` if you set it) until
-   `completed`. Always pass the path: after an MCP restart the default location is outside the
-   project. Never call `generate_speech` again for text that is still pending; if that text is no
-   longer wanted, `cancel_speech_job` it first. When an error carries
-   a `job_id`, follow its `recovery` field:
-   - interrupted (connection, timeout, write error): `get_speech_job` with the arguments it gives;
-   - `job_status: "failed"`, or `unknown_job`: the job is over; fix the cause if there is one and make
-     a new `generate_speech` call.
+   segment, so a single call can still be cut at paragraph breaks. Limits per call (all clips of a
+   clips call together): 20,000 characters, each `[pause]` ≤ 60 s and all pauses ≤ 600 s in total
+   (`input_too_long` / `invalid_pause` otherwise); up to 100 clips. Longer text: split at paragraph
+   boundaries into batches with one fixed `voice`, generate them in order and join them (step 6).
+   Jobs run one at a time on one GPU: make calls sequentially, not in parallel.
+5. **Long text and interrupted calls.** Status `pending` → call `next.tool` (`get_speech_job` or
+   `get_speech_clips`) with exactly `next.arguments` (job_id, the original absolute path, `overwrite`
+   if you set it) until done. Always pass the path: after an MCP restart the default location is
+   outside the project. Never submit text again while it is still pending; if it is no longer wanted,
+   `cancel_speech_job` it first. When an error carries a `job_id`, follow its `recovery` field:
+   - interrupted (connection, timeout, write error): the fetch tool with the arguments it gives;
+   - `job_status: "failed"`, or `unknown_job`: the job is over; fix the cause if there is one and
+     submit again.
+   A clips result with status `partial` lists each failed clip with `stage` and `error`, and its
+   `recovery` says what to do: clips that failed in synthesis need a new `generate_speech_clips`
+   call with only those clips (same voice); clips that were not written need `get_speech_clips` again.
    Pending results carry `estimated_remaining_seconds` (measured on this machine; loading the model
    when idle adds up to ~20 s). Lost a job_id (e.g. after a context reset)? `list_speech_jobs` finds
    it; do not resubmit the text.
@@ -81,9 +93,9 @@ Exit 0 = done, 1 = error (JSON on stderr), 3 = still running: the JSON has `job_
 
 Errors are JSON `{"error": {"code", "message", ...}}`.
 - `server_unreachable`: `systemctl --user start local-tts`, then `tts health`.
-- A completed result with `warnings` (a segment stayed suspiciously short: a sentence may be missing;
-  the warning quotes the passage): regenerate
-  that file once (`overwrite: true`); if the warning persists, tell the user which file and passage.
+- A completed result (or clip) with `warnings` (a segment stayed suspiciously short: a sentence may be
+  missing; the warning quotes the passage): regenerate that file or clip once (`overwrite: true`); if
+  the warning persists, tell the user which file and passage.
 - `queue_full`/`results_full`: wait a little and retry. `unknown_voice` / `unknown_model`: pick from `available`.
 - `cancelled`: the job was cancelled (by you or someone else); submit again if it is still needed.
   `job_finished`: the job had already finished, nothing to cancel.

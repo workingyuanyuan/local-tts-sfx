@@ -113,6 +113,23 @@ class SynthesisRequest:
     response_format: str = "wav"
     language: Optional[str] = None  # normalized code
     seed: Optional[int] = None
+    # A clips job: (clip id, text) pairs, each synthesized to its own audio in one pass (segments of
+    # different clips share batches and, without a voice, one reference). `text` then joins them.
+    clips: Optional[list[tuple[str, str]]] = None
+
+
+# Errors that fail one clip of a clips job; every other error fails the whole job.
+CLIP_ERRORS = ("segment_failed", "segment_truncated")
+
+
+@dataclass
+class ClipResult:
+    id: str
+    audio: Optional[np.ndarray]  # None when the clip failed
+    segments: int
+    timeline: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    error: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -127,6 +144,8 @@ class SynthesisResult:
     batch_size: int = 1
     # One entry per top-level segment: {"index", "paragraph", "start", "end", "text"} (seconds).
     timeline: list[dict[str, Any]] = field(default_factory=list)
+    # A clips job: one result per clip (then `audio` is empty and `warnings` are job-level).
+    clips: Optional[list[ClipResult]] = None
 
     @property
     def duration(self) -> float:
@@ -163,6 +182,14 @@ class _Synthesis:
         self.batch_size = max(1, int(adapter.entry.options.get("batch_size", 1)))
         self.prefetched: dict[int, SegmentAudio] = {}
         self.largest_batch = 1  # reported: the largest batch actually generated
+        # Clips job: the clip being rendered, and the clip each accepted slot belongs to (by id(slot)).
+        self.clip: Optional[int] = None
+        self.slot_clip: dict[int, int] = {}
+
+    def _label(self, seg_index: int) -> str:
+        if self.clip is None:
+            return f"segment {seg_index}"
+        return f"clip '{self.req.clips[self.clip][0]}' segment {seg_index}"
 
     def _budget(self, text: str) -> int:
         est = estimate_seconds(text)
@@ -294,7 +321,7 @@ class _Synthesis:
                 log.warning("segment %d attempt %d: %s", seg_index, attempt, last_problem)
         if best is not None:
             dur, audio, reference = best
-            warning = (f"segment {seg_index}: {dur:.1f}s of audio for ~{est:.1f}s of text after "
+            warning = (f"{self._label(seg_index)}: {dur:.1f}s of audio for ~{est:.1f}s of text after "
                        f"{self.cfg.max_retries} retries; a sentence may be missing from: {text}")
             log.warning(warning)
             slots = self._accept(audio, dur, reference, text, seg_index, depth, seed)
@@ -306,6 +333,8 @@ class _Synthesis:
     def _accept(self, audio: np.ndarray, dur: float, reference: Any, text: str, seg_index: int, depth: int,
                 seed: Optional[int]) -> list[list[np.ndarray]]:
         slot = [audio, seg_index]
+        if self.clip is not None:
+            self.slot_clip[id(slot)] = self.clip
         if self.follow_first and self.reference is None and reference is not None:
             if dur >= MIN_REFERENCE_SECONDS:
                 self.reference = reference
@@ -313,27 +342,139 @@ class _Synthesis:
                 self.early.append((slot, text, seg_index, depth, seed))
         return [slot]
 
-    def run(self) -> SynthesisResult:
-        segments = split_text(self.req.text, self.cfg.max_segment_seconds)
-        if not segments:
-            raise TTSError("empty_input", "Input contains no speakable text.", 400)
+    def _set_reference(self) -> None:
         if self.req.voice:
             self.reference = self.adapter.voice_reference(self.req.voice)
         else:
             self.follow_first = self.cfg.unvoiced_consistency == "first_segment"
-        slots = self._sequence(segments, None, 0, self.req.seed)
-        if self.reference is not None:
-            for slot, text, seg_index, depth, seed in self.early:
-                log.info("segment %d: re-rendering a short early piece with the reference voice", seg_index)
+
+    def _rerender_early(self, failed: Optional[dict[int, dict]] = None) -> None:
+        """Re-render the short pieces made before the reference voice existed. In a clips job
+        (`failed` given) a clip error only fails that clip."""
+        if self.reference is None:
+            return
+        for slot, text, seg_index, depth, seed in self.early:
+            if failed is not None:
+                self.clip = self.slot_clip[id(slot)]
+                if self.clip in failed:
+                    continue
+            log.info("%s: re-rendering a short early piece with the reference voice", self._label(seg_index))
+            try:
                 fresh = self._render(text, seg_index, depth, seed)
-                slot[0] = np.concatenate([x[0] for x in fresh], axis=1)
-                # the old take's warning no longer applies; the new take's warnings move to this slot
-                self.warnings = [(slot if any(s is x for x in fresh) else s, w) for s, w in self.warnings
-                                 if s is not slot]
+            except TTSError as e:
+                if failed is None or e.code not in CLIP_ERRORS:
+                    raise
+                failed[self.clip] = self._clip_error(e)
+                continue
+            except Exception as e:
+                if failed is not None and hasattr(e, "tts_segment"):
+                    e.tts_clip = self.req.clips[self.clip][0]
+                raise
+            slot[0] = np.concatenate([x[0] for x in fresh], axis=1)
+            # the old take's warning no longer applies; the new take's warnings move to this slot
+            self.warnings = [(slot if any(s is x for x in fresh) else s, w) for s, w in self.warnings
+                             if s is not slot]
+
+    def _clip_error(self, e: TTSError) -> dict[str, Any]:
+        cid = self.req.clips[self.clip][0]
+        log.warning("clip '%s' failed: %s %s", cid, e.code, e.message)
+        return {**e.to_dict(), "message": f"Clip '{cid}': {e.message}", "clip": cid}
+
+    def run(self) -> SynthesisResult:
+        if self.req.clips is not None:
+            return self.run_clips()
+        segments = split_text(self.req.text, self.cfg.max_segment_seconds)
+        if not segments:
+            raise TTSError("empty_input", "Input contains no speakable text.", 400)
+        self._set_reference()
+        slots = self._sequence(segments, None, 0, self.req.seed)
+        self._rerender_early()
         audio = np.concatenate([x[0] for x in slots], axis=1)
         return SynthesisResult(audio=audio, sample_rate=self.sample_rate, segments=len(segments),
                                retries=self.retries, splits=self.splits, warnings=[w for _, w in self.warnings],
                                batch_size=self.largest_batch, timeline=self._timeline(segments, slots))
+
+    def run_clips(self) -> SynthesisResult:
+        """Every clip's segments in one ordered list, so batches cross clip boundaries and, without a
+        voice, one reference serves all clips. Each clip gets its own audio, timeline and warnings;
+        a segment that fails for good (CLIP_ERRORS) fails only its clip."""
+        clips = self.req.clips
+        per_clip: list[list[Segment]] = []
+        flat: list[Segment] = []
+        owner: list[tuple[int, int]] = []  # flat index -> (clip, segment index within the clip)
+        for k, (cid, text) in enumerate(clips):
+            segs = split_text(text, self.cfg.max_segment_seconds)
+            if not segs:
+                raise TTSError("empty_input", f"Clip '{cid}' contains no speakable text.", 400, clip=cid)
+            per_clip.append(segs)
+            flat.extend(segs)
+            owner.extend((k, j) for j in range(len(segs)))
+        self._set_reference()
+        if self.progress:
+            self.progress(0, len(flat))
+        out: list[list[list]] = [[] for _ in clips]
+        failed: dict[int, dict[str, Any]] = {}
+        seed = self.req.seed
+        for i, seg in enumerate(flat):
+            k, j = owner[i]
+            self.clip = k
+            if k not in failed:
+                try:
+                    self._prefetch(flat, i, seed)
+                except Exception as e:
+                    seg = getattr(e, "tts_segment", None)
+                    if not isinstance(e, TTSError) and seg is not None:  # a flat index: name its clip
+                        e.tts_clip, e.tts_segment = clips[owner[seg][0]][0], owner[seg][1]
+                    raise
+                first = self.prefetched.pop(i, None)
+                try:
+                    slots = self._render(seg.text, j, 0, None if seed is None else seed + 1000 * (i + 1), first)
+                except TTSError as e:
+                    if e.code not in CLIP_ERRORS:
+                        raise
+                    failed[k] = self._clip_error(e)
+                except Exception as e:
+                    if hasattr(e, "tts_segment"):  # the scheduler reports where it crashed
+                        e.tts_clip = clips[k][0]
+                    raise
+                else:
+                    segs = per_clip[k]
+                    gap = seg.lead_silence
+                    if j > 0:
+                        prev = segs[j - 1]
+                        between = self.cfg.paragraph_gap_seconds if prev.paragraph_end else self.cfg.segment_gap_seconds
+                        gap += prev.trail_silence + between
+                    if gap > 0:
+                        out[k].append([self._silence(gap), None])
+                    out[k].extend(slots)
+                    if j == len(segs) - 1 and seg.trail_silence > 0:
+                        out[k].append([self._silence(seg.trail_silence), None])
+            else:
+                self.prefetched.pop(i, None)
+            if self.progress:
+                self.progress(i + 1, len(flat))
+        self._rerender_early(failed)
+        self.clip = None
+        if len(failed) == len(clips):
+            first = failed[0]
+            raise TTSError(first["code"], f"All {len(clips)} clips failed; first: {first['message']}", 500,
+                           clips=[failed[k] for k in sorted(failed)])
+        results = []
+        for k, (cid, _) in enumerate(clips):
+            if k in failed:
+                results.append(ClipResult(cid, None, len(per_clip[k]), error=failed[k]))
+                continue
+            results.append(ClipResult(
+                cid, np.concatenate([x[0] for x in out[k]], axis=1), len(per_clip[k]),
+                timeline=self._timeline(per_clip[k], out[k]),
+                warnings=[w for slot, w in self.warnings if self.slot_clip.get(id(slot)) == k]))
+        warnings = []
+        if self.follow_first and self.reference is None and len(clips) > 1:
+            warnings.append(f"No segment was at least {MIN_REFERENCE_SECONDS:.0f}s long, so the clips may not share "
+                            "one voice; pass a voice to keep one narrator.")
+        return SynthesisResult(audio=np.zeros((self.channels, 0), np.float32), sample_rate=self.sample_rate,
+                               segments=len(flat), retries=self.retries, splits=self.splits, warnings=warnings,
+                               batch_size=self.largest_batch, clips=results)
 
     def _timeline(self, segments: list[Segment], slots: list[list]) -> list[dict[str, Any]]:
         """Where each top-level segment's speech starts and ends in the final audio (gaps excluded)."""
